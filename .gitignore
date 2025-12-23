@@ -1,0 +1,29 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Conda / venv
+.env/
+.venv/
+conda/
+env/
+
+# VSCode
+.vscode/
+.vscode-server/
+
+# Logs / outputs
+# *.log
+# *.out
+# *.chk
+# *.wfn
+# *.cube
+
+# Data / cache
+data/
+.cache/
+EOF
+
+xt-*.py
