@@ -1,7 +1,7 @@
 import torch
 from torch_geometric.loader import DataLoader
 from pyg_VB_dataset import VBGraphDataset
-from vb_model import SimpleVBNet, E3nnVBnet
+from vb_model import E3nnVBnet
 
 def train():
     dataset = VBGraphDataset(
