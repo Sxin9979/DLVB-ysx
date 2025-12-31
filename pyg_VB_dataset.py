@@ -45,6 +45,8 @@ class VBGraphDataset(InMemoryDataset):
         for mol in tqdm(vbdata['molecules'], desc="Processing molecules"):
             nodes = int(mol.nodes)
             num_str = len(mol.str)
+            weights=torch.tensor([float(w) for w in mol.LowdinWeights], dtype=torch.float)
+            weights=weights / weights.sum() # 归一化
             pos = mol.coor.clone().detach().float()
             atom_nums = mol.atom_nums.clone().detach().long()
             edge_cursor = 0
@@ -62,8 +64,8 @@ class VBGraphDataset(InMemoryDataset):
                 # 4. 分割edge_attr
                 edge_attr = torch.tensor(mol.E[edge_cursor : edge_cursor + num_edge_i], dtype=torch.float)
                 edge_cursor += num_edge_i
-                # 5. 标签
-                y = torch.tensor([float(mol.LowdinWeights[i])], dtype=torch.float)
+                # 5. 标签 
+                y = weights[i].view(1)
                 # 6. 构造Data
                 data = Data(
                     x=x, # [node,3]
