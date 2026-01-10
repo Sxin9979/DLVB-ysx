@@ -1,0 +1,48 @@
+dataset:
+  root: /pool1/home/ysxin/E3nnVB/VB
+  task: regression
+
+training:
+  seed: 0
+  device: cuda
+  num_workers: 0
+  batch_size: 16
+  epochs: 50
+  lr: 1e-3
+  weight_decay: 1e-5
+  output_activation: sigmoid
+
+  loss: mse
+  # 学习率调控器
+  scheduler: 
+    name: reduce_on_plateau
+    mode: min
+    factor: 0.5
+    patience: 5
+    min_lr: 1e-6
+
+model:
+  lap_pe_k : 8
+  signnet:
+    phi_hidden: 64
+    phi_out: 16
+    phi_layers: 2
+    rho_hidden: 128
+    out_dim: 32
+    rho_layers: 2
+  
+  # --- irreps --- 
+  irreps_in: "35x0e" # 3 + out_dim(32) = 35
+  hidden_irreps: "32x0e + 16x1o + 8x2e"
+  irreps_out: "1x0e"
+  edge_mlp_hidden: 64
+
+  # ---geometry---
+  lmax_attr: 2 # 二阶球谐函数
+  edge_scalar_dim: 3
+  use_r2: true
+
+  # ---network---
+  layers: 4
+  norm: "batch"
+  pool: "mean"
