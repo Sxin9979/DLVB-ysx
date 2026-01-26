@@ -1,2 +1,2 @@
 # DLVB-ysx
-DLVB with E3nn
+DLVB with Equivariant NN

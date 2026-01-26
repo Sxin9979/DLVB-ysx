@@ -11,6 +11,8 @@ class GaussianRBF(nn.Module):
     Gaussian radial basis function expansion for scalar distance r
     r: [E,1] rbf(r): [E, num_basis]
     rbf_k(r) = exp(-(r-miu_k)^2 / (2*sigma^2))
+
+    
     """
     def __init__(self, r_min, r_max, num_basis, sigma):
         super().__init__()
@@ -54,7 +56,7 @@ class EquivariantConv(MessagePassing):
     def forward(self, x, edge_index, edge_sh, edge_scalar):
         return self.propagate(edge_index, x=x, edge_sh=edge_sh, edge_scalar=edge_scalar)
     
-    def _expand_gate_to_components(self, gate_ch):
+    def expand_gate(self, gate_ch):
         """
         Expand per-irrep scalar gates to per-component scaling factors.
         For each irrep, predict one scalar gate per edge
@@ -87,7 +89,7 @@ class EquivariantConv(MessagePassing):
         
         # gate = torch.sigmoid(self.edge_mlp(edge_scalar))
 
-        gate = self._expand_gate_to_components(gate_ch)        
+        gate = self.expand_gate(gate_ch)        
 
         msg = gate * self.tp(x_j, edge_sh)
         return msg
@@ -206,7 +208,7 @@ class E3nnVBnet(nn.Module):
             else:
                 edge_scalar = torch.cat([edge_scalar, r], dim=-1)        
 
-        # enforce scalar dim to match (edge_scalar_dim==3)
+        # enforce scalar dim to match (edge_scalar_dim==2 + RBF)
         if edge_scalar.shape[1] > self.edge_scalar_dim:
             edge_scalar = edge_scalar[:, :self.edge_scalar_dim]
         elif edge_scalar.shape[1] < self.edge_scalar_dim:

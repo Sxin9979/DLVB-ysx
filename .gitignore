@@ -29,7 +29,6 @@ data/
 
 
 # Scripts / helpers (local only)
-*.pt
 processed/
 raw/
 xt-*.py
@@ -38,6 +37,4 @@ train_submit.sbatch
 check*.py
 EOF
 
-# Logs
-logs/
-*.log
+
