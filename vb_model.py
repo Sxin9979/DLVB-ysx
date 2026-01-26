@@ -6,6 +6,25 @@ from e3nn.o3 import Irreps, spherical_harmonics,FullyConnectedTensorProduct, Lin
 from e3nn.nn import BatchNorm
 from LapPE import SignNet
 
+class GaussianRBF(nn.Module):
+    """
+    Gaussian radial basis function expansion for scalar distance r
+    r: [E,1] rbf(r): [E, num_basis]
+    rbf_k(r) = exp(-(r-miu_k)^2 / (2*sigma^2))
+    """
+    def __init__(self, r_min, r_max, num_basis, sigma):
+        super().__init__()
+        self.num_basis = int(num_basis) # k
+        self.sigma = float(sigma)
+        centers = torch.linspace(float(r_min), float(r_max), steps=self.num_basis)
+        self.register_buffer("centers",centers) # [k]
+    
+    def forward(self,r):
+        if r.dim()==2 and r.size(-1)==1:
+            r = r.squeeze(-1)
+        diff = r.unsqueeze(-1) - self.centers.unsqueeze(0)
+        return torch.exp(-0.5 * (diff / self.sigma)**2)
+
 class EquivariantConv(MessagePassing):
     """
     Equivariant message passing block:
@@ -24,17 +43,52 @@ class EquivariantConv(MessagePassing):
             irreps_hidden
         )
 
+        self.num_gate_channels = len(self.irreps_hidden)
+
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_mlp_in, edge_mlp_hidden),
             nn.SiLU(),
-            nn.Linear(edge_mlp_hidden, 1)
+            nn.Linear(edge_mlp_hidden, self.num_gate_channels)
         )
     
     def forward(self, x, edge_index, edge_sh, edge_scalar):
         return self.propagate(edge_index, x=x, edge_sh=edge_sh, edge_scalar=edge_scalar)
     
+    def _expand_gate_to_components(self, gate_ch):
+        """
+        Expand per-irrep scalar gates to per-component scaling factors.
+        For each irrep, predict one scalar gate per edge
+
+        gate_ch: [E, num_irrep]
+        return:  [E, irreps_hidden.dim]
+        """
+        E = gate_ch.shape[0]
+        device = gate_ch.device
+        dtype = gate_ch.dtype
+
+        out = torch.empty((E, self.irreps_hidden.dim), device=device, dtype=dtype)
+
+        ir_cursor = 0      # cursor in gate_ch (per-irrep)
+        comp_cursor = 0    # cursor in components (per irreps_hidden.dim)
+        for mul, ir in self.irreps_hidden:
+            g = gate_ch[:, ir_cursor:ir_cursor + 1] # [E,1]
+            ir_cursor += 1
+
+            # broadcast: [E,1] -> [E,1,1] -> [E,mul,ir.dim] -> [E, mul*ir.dim] (for 1o, ir.dim=3)
+            g_rep = g.view(E, 1, 1).expand(E, mul, ir.dim).reshape(E, mul * ir.dim)
+
+            out[:, comp_cursor:comp_cursor + mul * ir.dim] = g_rep
+            comp_cursor += mul * ir.dim
+
+        return out
+
     def message(self, x_j, edge_sh, edge_scalar):
-        gate = self.edge_mlp(edge_scalar)
+        gate_ch = torch.sigmoid(self.edge_mlp(edge_scalar))
+        
+        # gate = torch.sigmoid(self.edge_mlp(edge_scalar))
+
+        gate = self._expand_gate_to_components(gate_ch)        
+
         msg = gate * self.tp(x_j, edge_sh)
         return msg
     
@@ -61,8 +115,17 @@ class E3nnVBnet(nn.Module):
         self.irreps_out = Irreps(mcfg.get("irreps_out"))
 
         self.lmax_attr = mcfg.get("lmax_attr")
-        self.irreps_sh = Irreps.spherical_harmonics(self.lmax_attr)  # e.g., lmax=2 -> 0e+1o+2e
+        self.irreps_sh = Irreps.spherical_harmonics(self.lmax_attr)  # e.g., lmax=1 -> 0e+1o
         self.use_r2 = mcfg.get("use_r2")
+
+        self.use_rbf = mcfg.get("use_rbf")
+        rbf_cfg = mcfg.get("rbf")
+        self.rbf_r_min = rbf_cfg.get("r_min")
+        self.rbf_r_max = rbf_cfg.get("r_max")
+        self.rbf_num_basis = rbf_cfg.get("num_basis")
+        self.rbf_sigma = rbf_cfg.get("sigma")
+        self.rbf = GaussianRBF(self.rbf_r_min, self.rbf_r_max, self.rbf_num_basis, self.rbf_sigma) if self.use_rbf else None
+
         self.edge_scalar_dim = mcfg.get("edge_scalar_dim")
 
         self.num_layers = mcfg.get("layers")
@@ -70,6 +133,7 @@ class E3nnVBnet(nn.Module):
         self.pool = mcfg.get("pool", "mean").lower()
         self.residual = True
         edge_mlp_hidden = mcfg.get("edge_mlp_hidden")
+        self.output_activation = mcfg.get("output_activation","none").lower()
         
         self.embedding_tp = FullyConnectedTensorProduct(self.irreps_in, self.irreps_sh, self.hidden_irreps)
 
@@ -135,7 +199,12 @@ class E3nnVBnet(nn.Module):
 
         if self.use_r2:
             r = torch.norm(r_ij, dim=-1,keepdim=True) # r = bond lenth
-            edge_scalar = torch.cat([edge_scalar, r], dim=-1)        
+
+            if self.use_rbf :
+                rbf = self.rbf(r)
+                edge_scalar = torch.cat([edge_scalar, rbf], dim=-1)
+            else:
+                edge_scalar = torch.cat([edge_scalar, r], dim=-1)        
 
         # enforce scalar dim to match (edge_scalar_dim==3)
         if edge_scalar.shape[1] > self.edge_scalar_dim:
@@ -154,6 +223,8 @@ class E3nnVBnet(nn.Module):
         # --- node -> out_irreps then pool to graph ---
         out_node = self.to_out(x)  # [N, out_irreps.dim(1) ]
         out_graph = self.pool_nodes(out_node, batch, self.pool)  # [B, out_irreps.dim]
+        if self.output_activation == "sigmoid":
+            out_graph = torch.sigmoid(out_graph)
         return out_graph.view(-1)
     
 

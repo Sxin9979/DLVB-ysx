@@ -5,20 +5,15 @@ dataset:
 training:
   seed: 0
   device: cuda
-  num_workers: 0
-  batch_size: 16
-  epochs: 50
-  lr: 1e-3
+  num_workers: 1
+  batch_size: 64
+  epochs: 2000
+  lr: 1e-4
   weight_decay: 1e-5
-  output_activation: sigmoid
-
   loss: mse
   # 学习率调控器
   scheduler: 
-    name: reduce_on_plateau
-    mode: min
-    factor: 0.5
-    patience: 5
+    name: cosine
     min_lr: 1e-6
 
 model:
@@ -30,17 +25,25 @@ model:
     rho_hidden: 128
     out_dim: 32
     rho_layers: 2
+
+  output_activation: sigmoid
   
   # --- irreps --- 
   irreps_in: "35x0e" # 3 + out_dim(32) = 35
-  hidden_irreps: "32x0e + 16x1o + 8x2e"
+  hidden_irreps: "48x0e + 24x1o"
   irreps_out: "1x0e"
   edge_mlp_hidden: 64
 
   # ---geometry---
-  lmax_attr: 2 # 二阶球谐函数
-  edge_scalar_dim: 3
+  lmax_attr: 1 # 一阶球谐函数
+  edge_scalar_dim: 34
   use_r2: true
+  use_rbf: true
+  rbf:
+    r_min: 0.0
+    r_max: 6.0
+    num_basis: 32
+    sigma: 0.1
 
   # ---network---
   layers: 4

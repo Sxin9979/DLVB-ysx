@@ -82,6 +82,7 @@ class VBGraphDataset(InMemoryDataset):
                     y=y
                 )
 
+                data.str = mol.str[i]
                 data.lap_evals = evals_k
                 data.lap_evecs = evecs_k
                 data.molecule_id = mol.molecule_id
@@ -112,7 +113,7 @@ if __name__ == '__main__':
     print("Number of graphs:", len(dataset))  # 图数量
 
     d = dataset[0]
-    print(d)
+    print(d.molecule_id)
     print("x:", d.x.shape)
     print("edge_index:", d.edge_index.shape)
     print("edge_attr:", d.edge_attr.shape)

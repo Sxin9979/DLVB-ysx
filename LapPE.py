@@ -114,4 +114,4 @@ class SignNet(nn.Module):
 
         H = torch.cat(blocks, dim=1)  # [N, k*phi_out]
         V = self.rho(H)               # [N, out_dim]
-        return V              
+        return V

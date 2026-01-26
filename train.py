@@ -2,7 +2,6 @@ import random
 import torch
 import yaml
 import numpy as np
-import os
 from datetime import datetime
 from torch_geometric.loader import DataLoader
 from pyg_VB_dataset import VBGraphDataset
@@ -62,16 +61,11 @@ def train():
 
     loss_fn = torch.nn.MSELoss()
 
-    print(dataset[0].molecule_id, dataset[0].vb_index)
-
     sch = cfg["training"].get("scheduler", {})
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode=sch.get("mode","min"),
-        factor=float(sch.get("factor",0.5)),
-        patience=int(sch.get("patience",10)),
-        min_lr=float(sch.get("min_lr",1e-6)),
-        verbose=True
+        T_max=int(cfg["training"]["epochs"]),  
+        eta_min=float(sch.get("min_lr", 1e-6)) # minimal lr
     )
     
     model.train()
@@ -85,9 +79,6 @@ def train():
             optimizer.zero_grad()
             
             pred = model(data)
-            out_act = cfg.get("training", {}).get("output_activation", "none").lower()
-            if out_act == "sigmoid":
-                pred = torch.sigmoid(pred)
             y = data.y.view(-1)
             loss = loss_fn(pred,y)
             loss.backward()
@@ -101,14 +92,17 @@ def train():
         avg_mse = total_sq_error / total_samples
         mae = total_abs_error / total_samples
         rmse = avg_mse ** 0.5
-        scheduler.step(avg_mse) # 传入监控的指标
+        lr_now = optimizer.param_groups[0]["lr"]
 
         print(
             f"Epoch {epoch:03d} | "
             f"Loss(MSE)={avg_mse:.6f} | "
             f"MAE={mae:.6f} | "
-            f"RMSE={rmse:.6f}"
+            f"RMSE={rmse:.6f} | "
+            f"LR={lr_now:.2e}"
         )
+
+        scheduler.step()
 
 if __name__ == "__main__":
     train()

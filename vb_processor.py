@@ -42,6 +42,21 @@ class VBinfo_collector:
 
         return atom_to_number     
     
+    def read_nao_nae_from_out(self, file_path):
+        """ Read nao / nae from the $ctrl block in .out or .xmo. """
+        text = Path(file_path).read_text(encoding='utf-8', errors='ignore')
+        m = re.search(r'(?is)\$ctrl(.*?)(\$end|\n\s*\$)', text)
+        ctrl = m.group(1) if m else text  # fallback: search whole file
+
+        m_nae = re.search(r'(?i)\bnae\s*=\s*(\d+)\b', ctrl)
+        m_nao = re.search(r'(?i)\bnao\s*=\s*(\d+)\b', ctrl)
+        if (m_nae is None) or (m_nao is None):
+            raise ValueError(f"Cannot parse nae/nao from $ctrl in file: {file_path}")
+
+        nae = int(m_nae.group(1))
+        nao = int(m_nao.group(1))
+        return nao, nae
+    
     # def covalent_radii(coor,nodes,atom_nums): 
     #     """ 生成共价半径和距离矩阵 """
     #     radius = {
@@ -134,7 +149,7 @@ class VBinfo_collector:
             orbital_list = [f"{atom}:{value:.6f}" for atom, value in sorted_atoms if value != 0]
             orb_sum.append(orbital_list)
 
-        print("orb_sum:\n",orb_sum)
+        # print("orb_sum:\n",orb_sum)
         return orb_sum
 
     def orb_match_atom(self, orbital_matched): 
@@ -185,26 +200,99 @@ class VBinfo_collector:
 
         # 提取成键信息
         bonds = []
-
         for bond in mol.GetBonds():
             a1 = bond.GetBeginAtom()
             a2 = bond.GetEndAtom()
             idx1, idx2 = a1.GetIdx()+1, a2.GetIdx()+1
             symbol1, symbol2 = a1.GetSymbol(), a2.GetSymbol()
+
             order = str(bond.GetBondType())
-            bd=0
+            bd = 0
+            is_arom = 0
             if order == "SINGLE":
-                bd=1
+                bd = 1
             elif order == "DOUBLE":
-                bd=2
+                bd = 2
             elif order == "TRIPLE":
-                bd=3
+                bd = 3
             elif order == "AROMATIC": # 芳香性
-                bd=10
-            bonds.append((symbol1,idx1,symbol2,idx2,order,bd))
+                bd = 1
+                is_arom = 1
+            else:
+                bd = 1
+            bonds.append((symbol1,idx1,symbol2,idx2,order,bd,is_arom))
         return bonds
 
+    def _parts_to_tokens(self, parts):
+        """parts can be str / list[str] / nested list. Return flat list[str] tokens split by whitespace."""
+        if parts is None:
+            return []
+        if isinstance(parts, str):
+            return parts.strip().split()
+
+        toks = []
+        if isinstance(parts, (list, tuple)):
+            for x in parts:
+                if x is None:
+                    continue
+                if isinstance(x, str):
+                    toks.extend(x.strip().split())
+                elif isinstance(x, (list, tuple)):
+                    for y in x:
+                        if isinstance(y, str):
+                            toks.extend(y.strip().split())
+                        else:
+                            toks.append(str(y))
+                else:
+                    toks.append(str(x))
+        else:
+            toks = str(parts).strip().split()
+        return toks
+
+
+    def active_pairs_analysis(self, parts, atom_from_orb):
+        """
+        Paring active orbitals(o1,o2), drop the last if odd count
+        - o1==o2: doubly occupied, no bond
+        - o1!=o2: active bond between o1 and o2
+        """
+        vb_str = self._parts_to_tokens(parts)
+
+        norm_str = []
+        for chars in vb_str: 
+            if chars is None:
+                continue
+            if ":" in chars:
+                continue
+            if "-" in chars:
+                a, b = chars.split("-",1)
+                norm_str.append(int(a))
+                norm_str.append(int(b))
+            else:
+                norm_str.append(int(chars))
+        if len(norm_str) < 2:
+            return []
+        if len(norm_str) % 2 != 0:
+            norm_str = norm_str[:-1]
+
+        active_pairs = []
+
+        for k in range(0,len(norm_str),2):
+            o1, o2 = norm_str[k], norm_str[k+1]
+            if o1==o2:
+                continue
+            atom_1 = int(atom_from_orb[o1 - 1, 2])
+            atom_2 = int(atom_from_orb[o2 - 1, 2])
+            if atom_1==atom_2:
+                continue
+
+            active_pairs.append((atom_1, atom_2))
+        
+        return active_pairs
+
     def read_geo_from_out_files(self, file_path, VBdata): # 从输出文件读取信息
+
+        VBdata.nao, VBdata.nae = self.read_nao_nae_from_out(file_path)
 
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
             lines = file.readlines()
@@ -249,18 +337,25 @@ class VBinfo_collector:
             line=line.strip()
             if "Lowdin Weights" in line:
                 in_weight_section = True
-                print("Now in the Lowdin Weight section...\n")
+                # print("Now in the Lowdin Weight section...\n")
                 continue
             elif "Inverse Weights" in line and in_weight_section:
                 print("Now end the weights part ")
                 break
             elif in_weight_section and line:
                 weights = line.split()
+                if not any("1:" in p for p in weights):
+                    continue
                 weight_data.append(weights[1])
                 for i, part in enumerate(weights):
                     if '1:' in part:
                         str_data.append(weights[i:])
                         break
+        if len(weight_data) != len(str_data):
+            raise ValueError(
+                f"[VB Processor ERROR] Weight/structure mismatch: "
+                f"{len(weight_data)} weights vs {len(str_data)} structures"
+            )    
 
         VBdata.LowdinWeights=weight_data
         VBdata.str=str_data
@@ -275,7 +370,7 @@ class VBinfo_collector:
             line=line.strip("\n")
             s = line.strip()
             if start_marker in line :
-                print("Now in the Orbitals part")
+                # print("Now in the Orbitals part")
                 in_orbital_section = True
                 continue
             if not in_orbital_section:
@@ -293,82 +388,111 @@ class VBinfo_collector:
         
         # VBdata.atom_from_orb: 生成[num_orbs, 3]的tensor，第一列为轨道数，第二列为对应的原子序数，第三列为对应的原子数(即几号原子)。形如[[1,6,1],[2,6,2],[3,6,3],...,]
         # print(VBdata.atom_from_orb)
-        print("read_geo_from_out_files is ok, now show the VBdata.atom_nums and VBdata.coor \n",VBdata.atom_nums, VBdata.coor)
+        # print("read_geo_from_out_files is ok, now show the VBdata.atom_nums and VBdata.coor \n",VBdata.atom_nums, VBdata.coor)
+        print("read_geo_from_out_files is ok")
 
         return VBdata
 
     def generate_A(self,VBdata): 
-        """生成邻接矩阵和边特征"""
+        """ 生成邻接矩阵和边特征 """
 
         num_graph=len(VBdata.str) # 每个分子的结构数，即这个分子的图的数量
         nodes=VBdata.nodes
+
         Amat=torch.zeros(num_graph, nodes, nodes, dtype=torch.int)
-        A_BO_inact=torch.zeros(nodes, nodes, dtype=torch.int)    # 所有的结构，A_BO_inact都是一样的
-        A_BO_act=torch.zeros(num_graph, nodes, nodes, dtype=torch.int)
-        BO_if_changed=torch.zeros(nodes, nodes, dtype=torch.int) # 用来判断该非活性键级是否修改过，避免累计
-        
-        # 得到一个通过RDkit形成的键级矩阵，非活性部分解决
+        A_BO_inact=torch.zeros(nodes, nodes, dtype=torch.int)           # 非活性键级，对所有结构共享
+        A_BO_act=torch.zeros(num_graph, nodes, nodes, dtype=torch.int)  # 活性键级，每个结构不同
+        BO_if_changed=torch.zeros(nodes, nodes, dtype=torch.int)        # 判断该非活性键级是否修改过，避免累计
+        A_AROM = torch.zeros(nodes, nodes, dtype=torch.int) 
+
+        # 1) 通过RDkit形成经验键级矩阵（非活性骨架）
         bonds=self.get_bond_info(VBdata.sym, VBdata.coor)
 
-        for parts in bonds:  
-            # print(parts[1]-1," ",parts[3]-1, " + ", parts[5])
-            A_BO_inact[parts[1]-1][parts[3]-1]=A_BO_inact[parts[3]-1][parts[1]-1]=parts[5]
-            # print("A_BO_inact: before change\n",A_BO_inact)
+        for b in bonds:  
+            a1 = b[1]-1
+            a2 = b[3]-1
+            bo = b[5]
+            is_arom = b[6]
+
+            A_BO_inact[a1][a2]=A_BO_inact[a2][a1]=bo
+            A_AROM[a1][a2] = A_AROM[a2][a1] = is_arom
+
             for i in  range(num_graph):
-                Amat[i][parts[1]-1][parts[3]-1]=Amat[i][parts[3]-1][parts[1]-1]=1
+                Amat[i][a1][a2]=Amat[i][a2][a1]=1
         
+        # 2) 判断该分子活性部分是否具有共轭性(if_cov)
         # 开始遍历活性轨道对应的原子，如果经验键级矩阵的这部分原子之间成双键/多键，那么σ键就是非活性的；如果经验键级矩阵的原子之间只有单键，那么σ键就是活性的  
+        if_cov=0
         for idx, parts in enumerate(VBdata.str):
-            # 首先判断该分子的活性部分是否具有共轭性
-            if_cov=0
-            for chars in parts:
-                if "-" in chars: 
-                    orb_1, orb_2 = chars.split('-')
-                    atom_1=VBdata.atom_from_orb[int(orb_1)-1, 2]
-                    atom_2=VBdata.atom_from_orb[int(orb_2)-1, 2]
-                    if A_BO_inact[atom_1-1, atom_2-1]>1:
-                        if_cov=1
-                        break
-            if if_cov==1: break
+            active_pairs = self.active_pairs_analysis(parts, VBdata.atom_from_orb)
+            for (atom_1, atom_2) in active_pairs:
+                if A_BO_inact[atom_1 - 1, atom_2 - 1] >1:
+                    if_cov = 1
+                    break
+            if if_cov == 1:
+                break
 
+            # for chars in parts:
+            #     if "-" in chars: 
+            #         orb_1, orb_2 = chars.split('-')
+            #         atom_1=VBdata.atom_from_orb[int(orb_1)-1, 2]
+            #         atom_2=VBdata.atom_from_orb[int(orb_2)-1, 2]
+            #         if A_BO_inact[atom_1-1, atom_2-1]>1:
+            #             if_cov=1
+            #             break
+            # if if_cov==1: break
 
+        # 3) 对每个结构，把活性键加入邻接矩阵与A_BO_act
         for idx, parts in enumerate(VBdata.str):
-            for chars in parts:
-                if "-" in chars: 
-                    orb_1, orb_2 = chars.split('-')
-                    atom_1=VBdata.atom_from_orb[int(orb_1)-1, 2]
-                    atom_2=VBdata.atom_from_orb[int(orb_2)-1, 2]
-                    Amat[idx, atom_1-1, atom_2-1] = 1
-                    Amat[idx, atom_2-1, atom_1-1] = 1
-                    A_BO_act[idx, atom_1-1, atom_2-1] += 1
-                    A_BO_act[idx, atom_2-1, atom_1-1] += 1
+            active_pairs = self.active_pairs_analysis(parts, VBdata.atom_from_orb)
+            
+            for (atom_1, atom_2) in active_pairs:
+                i = atom_1 -1
+                j = atom_2 -1
 
-                    if A_BO_inact[atom_1-1, atom_2-1]==1 and BO_if_changed[atom_1-1, atom_2-1]==0 and if_cov==0 : 
-                        # 说明活性轨道对应的经验键级是1，那么这个键就是活性的，因此非活性键级矩阵A_BO_inact应该修改为0
-                        # print("A_BO_inact[atom_1-1, atom_2-1]", atom_1-1, atom_2-1, A_BO_inact[atom_1-1, atom_2-1])
-                        A_BO_inact[atom_1-1, atom_2-1]=A_BO_inact[atom_2-1, atom_1-1]=0
-                        BO_if_changed[atom_1-1, atom_2-1]=1
-                    elif A_BO_inact[atom_1-1, atom_2-1]>1 and BO_if_changed[atom_1-1, atom_2-1]==0 and if_cov==1 : 
-                        # 说明活性轨道对应的经验键级大于1，那么这个键中，大于1的键级是活性的，σ键是非活性的，因此非活性键级矩阵A_BO_inact应该修改为1
-                        A_BO_inact[atom_1-1, atom_2-1]=A_BO_inact[atom_2-1, atom_1-1]=1
-                        BO_if_changed[atom_1-1, atom_2-1]=1
+                # a) 邻接矩阵：活性键连接
+                Amat[idx, i, j] = 1
+                Amat[idx, j, i] = 1
 
-        # print("Amat\n",Amat[13],"\n")
-        # print("A_BO_act\n",A_BO_act[13],"\n")
-        # print("A_BO_inact\n",A_BO_inact,"\n")
+                # b) 活性键级： 出现一次active_pair就+1
+                A_BO_act[idx, i, j] += 1
+                A_BO_act[idx, j, i] += 1
+            
+                # c) 非活性键级：修正
+                if A_AROM[i,j] == 1:
+                    # 对于芳香键: A_BO_inact保持1（σ背景）
+                    A_BO_inact[i,j]=A_BO_inact[j,i] = 1
+                    BO_if_changed[i,j]=BO_if_changed[j,i]=1
+                if A_BO_inact[i,j]==1 and BO_if_changed[i,j]==0 and if_cov==0 :
+                    # 普通单键：活性轨道对应的经验键级是1(σ键->活性)，因此非活性键级矩阵A_BO_inact修改为0
+                    A_BO_inact[i,j] = A_BO_inact[j,i] = 0
+                    BO_if_changed[i,j] = BO_if_changed[j,i] = 1
+                elif A_BO_inact[i,j]>1 and BO_if_changed[i,j]==0 and if_cov==1 :
+                    # 多键：活性轨道对应的经验键级>1(σ键->非活性，其余键->活性)，因此非活性键级矩阵A_BO_inact应该修改为1
+                    A_BO_inact[i,j] = A_BO_inact[j,i] = 1
+                    BO_if_changed[i,j] = BO_if_changed[j,i] = 1
 
+        # 4) 生成A_list和E（E:[2*BO_act, 2*BO_inact, dx,dy,dz]）
         A_list=[[],[]]
         E=[]
 
         for str_idx in range(num_graph):
-            for i in range(VBdata.nodes):
-                for j in range(VBdata.nodes):
+            for i in range(nodes):
+                for j in range(nodes):
+                    if i==j:
+                        continue
                     if Amat[str_idx][i][j]:
                         A_list[0].append(i+1)
                         A_list[1].append(j+1)
 
-                        relative_coor=[VBdata.coor[j]-VBdata.coor[i]]
-                        edge_row=[2 * A_BO_act[str_idx][i][j].item(), 2 * A_BO_inact[i][j].item(),relative_coor[0][0].item(),relative_coor[0][1].item(),relative_coor[0][2].item()]
+                        relative_coor=VBdata.coor[j]-VBdata.coor[i]
+                        edge_row=[
+                            2 * A_BO_act[str_idx][i][j].item(), 
+                            2 * A_BO_inact[i][j].item(),
+                            relative_coor[0].item(),
+                            relative_coor[1].item(),
+                            relative_coor[2].item()
+                        ]
                         E.append(edge_row)
                         # E:num_edge*5,这条边的活性电子数，这条边的非活性电子数，这条边的三个相对坐标（用于等变性）
         
@@ -377,35 +501,141 @@ class VBinfo_collector:
         VBdata.E=E
         return VBdata
 
+
     def generate_X(self, VBdata): 
-        """ 生成节点特征矩阵 X: [nodes, 3*str], 第一列为每个原子的原子序数，第二列为每个原子的活性电子数，第三列为每个原子的非活性电子数 """
-        X=None
+        """ 
+        生成节点特征矩阵 X: [nodes, 3*str]
+        每个结构对应3列：
+            col_0: 原子序数Z
+            col_1: 活性电子数
+            col_2: 非活性电子数 
+        """
+        print("Now begin generate inactive part...")
 
-        print("Now begin generate_X...\n",VBdata.atom_from_orb,"\n",VBdata.str)
-        for index, parts in enumerate(VBdata.str):
-            X_part=torch.zeros(VBdata.nodes,3)
-            X_part[:,0]=VBdata.atom_nums
-            for chars in parts:
-                if "1:" in chars: 
+        nao = int(VBdata.nao)
+        nae = int(VBdata.nae)
+        num_atoms = int(VBdata.nodes)
+        Z = VBdata.atom_nums.clone().detach().float()
+
+        def get_inactive_orb_max(parts):
+            for s in parts:
+                if "1:" in s:
+                    return int(s.split(":")[1])
+            return None
+
+        def expand_active_orbs(parts):
+            """ 输入VB结构，返回列表occ，表示活性轨道占据序列 """
+            occ = []
+            for s in parts:
+                if "1:" in s:
                     continue
-                elif "-" in chars:
-                    orb_1, orb_2 = chars.split('-')
-                    X_part[VBdata.atom_from_orb[int(orb_1)-1,2]-1,1]+=1
-                    X_part[VBdata.atom_from_orb[int(orb_2)-1,2]-1,1]+=1
+                if "-" in s:
+                    a, b = s.split("-")
+                    occ.append(int(a))
+                    occ.append(int(b))
                 else:
-                    orb_3=int(chars)
-                    X_part[VBdata.atom_from_orb[int(orb_3)-1,2]-1,1]+=1
+                    occ.append(int(s))
+            return occ
 
-            X_part[:,2] = X_part[:,0]-X_part[:,1]
+        inactive_orb_max = get_inactive_orb_max(VBdata.str[0]) # 非活性轨道的终点
+        active_orb_start = inactive_orb_max + 1 # 活性轨道的起点
+        total_orb = int(VBdata.atom_from_orb.size(0)) # 总轨道数
+
+        if inactive_orb_max is None:
+            # 如果轨道中没有形如“1：”的部分，就用最后NAO个轨道当作活性轨道
+            inactive_orb_max = total_orb - nao
+
+        # --- 开始构造非活性部分-作为分子背景 ---
+        inactive_e = torch.zeros(num_atoms, dtype=torch.float32)
+        
+        if nae==nao:
+            acorb_each_atom = torch.zeros(num_atoms, dtype=torch.float32) # 每个原子上的活性轨道数目
+            for orb in range(active_orb_start, total_orb+1):
+                atom = int(VBdata.atom_from_orb[orb-1,2])-1
+                acorb_each_atom[atom] +=1
+            inactive_e = Z - acorb_each_atom
+        
+        elif nae>nao:
+            # 选择参考str：覆盖所有活性轨道并且权重最大的str
+            best_i = None # 参考结构的位置
+            best_w = None # 参考结构的权重
+
+            for i,parts in enumerate(VBdata.str):
+                occ = expand_active_orbs(parts)
+                if len(set(occ)) != nao:
+                    continue
+                w = float(VBdata.LowdinWeights[i])
+                if (best_w is None) or (w > best_w) :
+                    best_w = w
+                    best_i = i
             
-            if X is None:
-                X=X_part
-            else:
-                X=torch.cat([X,X_part],dim=1)
+            if best_i is None: # 选用最大权重的结构
+                weights = [float(w) for w in VBdata.LowdinWeights] if len(VBdata.LowdinWeights) else [0.0] * len(VBdata.str)
+                best_i = int(np.argmax(weights)) if len(weights) else 0
+                print(f"[Warn][generate_X] Cannot find reference str with unique_orb==NAO. Fallback to max-weight str index={best_i}.")
+            
+            ref_occ = expand_active_orbs(VBdata.str[best_i])
+            ref_active_e = torch.zeros(num_atoms, dtype=torch.float32)
 
-        VBdata.X=X
-        print(f"VBdata.X:\n{VBdata.X[0]}")
+            for orb in ref_occ:
+                atom = int(VBdata.atom_from_orb[int(orb) - 1, 2]) - 1
+                ref_active_e[atom] += 1
+            
+            inactive_e = Z - ref_active_e
+
+        else:
+            raise NotImplementedError(f"NAE < NAO not implemented yet (nae={nae}, nao={nao}).")
+
+        X = None
+        
+        print(f"Now begin generate_X... (nao={nao}, nae={nae})")
+
+        for index, parts in enumerate(VBdata.str):
+            X_part = torch.zeros(num_atoms, 3, dtype=torch.float32)
+            X_part[:, 0] = Z
+            X_part[:, 2] = inactive_e  # 非活性部分
+
+            occ = expand_active_orbs(parts)
+
+            for orb in occ:
+                atom = int(VBdata.atom_from_orb[int(orb) - 1, 2]) - 1
+                X_part[atom, 1] += 1.0
+            
+            X = X_part if X is None else torch.cat([X, X_part], dim=1)
+
+        VBdata.X = X
         return VBdata
+
+        # for index, parts in enumerate(VBdata.str):
+        #     X_part=torch.zeros(VBdata.nodes,3)
+        #     X_part[:,0]=VBdata.atom_nums
+
+        #     for chars in parts:
+        #         if "1:" in chars: 
+        #             inactive_orb_max = int(chars.split(":")[1])
+        #             for orb in range(1,inactive_orb_max + 1):
+        #                 atom = VBdata.atom_from_orb[orb-1,2] -1
+        #                 X_part[atom,2] += 2
+
+        #         elif "-" in chars:
+        #             orb_1, orb_2 = chars.split('-')
+        #             atom_1 = VBdata.atom_from_orb[int(orb_1) - 1, 2] - 1
+        #             atom_2 = VBdata.atom_from_orb[int(orb_2) - 1, 2] - 1
+        #             X_part[atom_1,1]+=1
+        #             X_part[atom_2,1]+=1
+        #         else:
+        #             orb = int(chars)
+        #             atom = VBdata.atom_from_orb[orb-1,2] -1
+        #             X_part[atom,1]+=1
+            
+        #     if X is None:
+        #         X=X_part
+        #     else:
+        #         X=torch.cat([X,X_part],dim=1)
+
+        # VBdata.X=X
+        # # print(f"VBdata.X:\n{VBdata.X[0]}")
+        # return VBdata
 
     def process_single_file(self, file_path):
         """处理单个.out文件"""
@@ -418,16 +648,20 @@ class VBinfo_collector:
         return VBdata
 
     def process_directory(self, directory_path):
-        """处理目录中的所有.out文件"""
+        """处理目录中的所有.out + .xmo文件"""
         directory=Path(directory_path)
         out_files = list(directory.glob("*.out")) + list(directory.glob("*.xmo"))
-
+        sum_file_processed = 0 # 总处理文件数
+        sum_VBstr = 0 # 总结构数
         for file_path in out_files:
             print(f"处理文件：{file_path.name}")
             VBdata=self.process_single_file(file_path)
             if VBdata:
                 self.all_molecules.append(VBdata)
                 print(f"成功处理{file_path.name}, 包含{len(VBdata.str)}个价键结构")
+                sum_file_processed += 1
+                sum_VBstr += len(VBdata.str)
+        print(f"共处理{sum_file_processed}个文件，共包含{sum_VBstr}个价键结构")
 
     def get_all_molecules(self):
         """获取所有处理好的分子数据"""

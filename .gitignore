@@ -15,17 +15,22 @@ env/
 .vscode-server/
 
 # Logs / outputs
-# *.log
-# *.out
-# *.chk
-# *.wfn
-# *.cube
+logs/
+*.log
+*.out
+*.err
+
+# Program outputs
 out_file/
-*.xmo
 
 # Data / cache
 data/
 .cache/
-EOF
 
+
+# Scripts / helpers (local only)
 xt-*.py
+collect_converged_xmo.py
+train_submit.sbatch
+check*.py
+EOF
