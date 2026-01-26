@@ -29,6 +29,9 @@ data/
 
 
 # Scripts / helpers (local only)
+*.pt
+processed/
+raw/
 xt-*.py
 collect_converged_xmo.py
 train_submit.sbatch
