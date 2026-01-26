@@ -37,3 +37,7 @@ collect_converged_xmo.py
 train_submit.sbatch
 check*.py
 EOF
+
+# Logs
+logs/
+*.log
