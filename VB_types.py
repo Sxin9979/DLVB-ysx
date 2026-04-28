@@ -11,7 +11,7 @@ class VBinformation:
     atom_nums: List[int] = field(default_factory=list) # 原子序数
     coor: List = field(default_factory=list) # 笛卡尔坐标
     str: List = field(default_factory=list) # VB结构
-    atom_from_orb: List = field(default_factory=list) 
+    atom_from_orb: List = field(default_factory=list)
     A_mat: List = field(default_factory=list) # 邻接矩阵
     A_list: List[List[int]] = field(default_factory=lambda: [[], []]) # 邻接列表
     E: List = field(default_factory=list) # 边特征，包括活性电子数、非活性电子数以及边的相对坐标

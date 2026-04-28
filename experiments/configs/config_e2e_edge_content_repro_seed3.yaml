@@ -1,0 +1,62 @@
+data:
+  xmo_dir: /pool1/home/ysxin/E3nn/E3VB/out_file
+  seed: 3
+  split: [0.8, 0.1, 0.1]
+  processed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/processed_dataset_cache.pkl
+  packed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/packed_dataset_cache.pkl
+  max_structures_per_chunk: 16
+
+model:
+  atom:
+    input_feature_dim: 3
+    scalar_dim: 128
+    vector_dim: 32
+    radial_dim: 64
+    layers: 4
+    max_atomic_number: 128
+    radial_min: 0.0
+    radial_max: 2.0
+    radial_basis: 64
+    lmax: 1
+    lap_pe_k: 8
+    edge_content_modulation: true
+    edge_content_hidden_dim: 64
+    signnet:
+      phi_hidden: 64
+      phi_out: 16
+      phi_layers: 2
+      rho_hidden: 128
+      out_dim: 32
+      rho_layers: 2
+
+  orbital:
+    scalar_dim: 128
+    vector_dim: 32
+    slot_dim: 128
+    slot_query_dim: 128
+    slot_embedding_dim: 32
+    max_active_slots: 8
+    orbital_feature_dim: 128
+
+  rumer:
+    orbital_feature_dim: 128
+    hidden_dim: 128
+    edge_embedding_dim: 16
+    layers: 3
+    mode: active_only_low_risk
+
+training:
+  seed: 3
+  batch_size: 16
+  epochs: 2000
+  learning_rate: 1.0e-3
+  min_learning_rate: 1.0e-6
+  weight_decay: 1.0e-5
+  early_stopping_patience: 0
+  early_stopping_start_epoch: 0
+  bucketed_batching: true
+  bucket_key: num_atoms_num_orbitals
+  train_drop_remainder: false
+  slot_diversity_weight: 1.0e-2
+  checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/checkpoints/best_e2e_edge_content_repro_seed3.pkl
+  log_path: /pool1/home/ysxin/E3nn/E3VB/logs/train_e2e_edge_content_repro_seed3.log

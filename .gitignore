@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.pyc
@@ -23,18 +22,18 @@ logs/
 # Program outputs
 out_file/
 
-# Data / cache
-data/
-.cache/
-
-
-# Scripts / helpers (local only)
+# Data caches and local runtime artifacts
 processed/
 raw/
+.cache/
+
+# Model artifacts
+checkpoints/
+archive_unused/checkpoints/
+Rumer/*.pt
+
+# Local helpers
 xt-*.py
 collect_converged_xmo.py
 train_submit.sbatch
 check*.py
-EOF
-
-

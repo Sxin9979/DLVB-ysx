@@ -1,0 +1,15 @@
+# Core numerical stack
+jax>=0.4.26
+jaxlib>=0.4.26
+numpy>=1.24
+
+# Model and optimization
+flax>=0.10.0
+optax>=0.2.3
+e3nn-jax>=0.20.8
+jraph>=0.0.6.dev0
+
+# Data pipeline and IO
+grain>=0.2.3
+PyYAML>=6.0
+rdkit>=2023.0
