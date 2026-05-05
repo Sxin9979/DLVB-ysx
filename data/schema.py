@@ -1,12 +1,29 @@
 """Data schema objects for the end-to-end JAX E3VB pipeline."""
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import jax
 import jax.numpy as jnp
 import jraph
 import numpy as np
+
+
+@dataclass
+class DatasetSourceConfig:
+    """
+    Describe one logical dataset that contributes molecules to unified training.
+
+    Arguments:
+    - dataset_id: Stable dataset name used for split accounting and metrics.
+    - xmo_dir: Directory containing ``.xmo`` files for this dataset.
+    - split: Optional per-dataset train/val/test split ratios. When omitted, the
+      global data split from the top-level config is used.
+    """
+
+    dataset_id: str
+    xmo_dir: str
+    split: Optional[tuple[float, float, float]] = None
 
 
 @dataclass
@@ -20,6 +37,7 @@ class UnifiedSample:
     - Hold molecule-normalized regression target.
 
     Arguments:
+    - dataset_id: Source dataset identifier for balanced sampling / reporting.
     - molecule_id: Molecule identifier string.
     - vb_index: VB-structure index inside the molecule.
     - atom_numbers: Atomic numbers, shape [num_atoms].
@@ -53,8 +71,11 @@ class UnifiedSample:
     - active_rumer_edge_type: Active-only Rumer edge type ids, shape [num_active_rumer_edges].
     - target: Molecule-normalized label y_true / y_max.
     - target_max: Molecule-level y_max used in normalization.
+    - top_mass_focus: Whether this structure belongs to the molecule-local
+      cumulative-mass focus set used by the top-mass objective.
     """
 
+    dataset_id: str
     molecule_id: str
     vb_index: int
     atom_numbers: np.ndarray
@@ -77,6 +98,7 @@ class UnifiedSample:
     active_rumer_edge_type: np.ndarray
     target: float
     target_max: float
+    top_mass_focus: float = 0.0
 
 
 @dataclass
@@ -104,6 +126,8 @@ class ProcessedStructureSample:
     - active_rumer_edge_type: Active-only Rumer edge type ids, shape [num_active_rumer_edges].
     - target: Molecule-normalized label y_true / y_max.
     - target_max: Molecule-level y_max used in normalization.
+    - top_mass_focus: Whether this structure belongs to the molecule-local
+      cumulative-mass focus set used by the top-mass objective.
     """
 
     vb_index: int
@@ -125,6 +149,7 @@ class ProcessedStructureSample:
     active_rumer_edge_type: np.ndarray
     target: float
     target_max: float
+    top_mass_focus: float = 0.0
 
 
 @dataclass
@@ -133,6 +158,7 @@ class ProcessedMolecule:
     Store one processed molecule with static geometry cached once.
 
     Arguments:
+    - dataset_id: Source dataset identifier for this molecule.
     - molecule_id: Molecule identifier string.
     - atom_numbers: Atomic numbers, shape [num_atoms].
     - atom_positions: Cartesian coordinates, shape [num_atoms, 3].
@@ -142,6 +168,7 @@ class ProcessedMolecule:
     - structures: Structure-specific samples belonging to this molecule.
     """
 
+    dataset_id: str
     molecule_id: str
     atom_numbers: np.ndarray
     atom_positions: np.ndarray
@@ -157,6 +184,7 @@ class ProcessedMoleculeChunk:
     Store one single-molecule chunk used by training/evaluation loaders.
 
     Arguments:
+    - dataset_id: Source dataset identifier for the parent molecule.
     - molecule_id: Parent molecule identifier.
     - chunk_index: Chunk index inside the parent molecule.
     - num_chunks: Total number of chunks for the parent molecule.
@@ -168,6 +196,7 @@ class ProcessedMoleculeChunk:
     - structures: Structure-specific samples contained in this chunk.
     """
 
+    dataset_id: str
     molecule_id: str
     chunk_index: int
     num_chunks: int
@@ -185,12 +214,16 @@ class ProcessedDatasetCache:
     Store a fully processed dataset payload that can be reused across runs.
 
     Arguments:
+    - dataset_ids: Ordered dataset identifiers included in this cache.
     - split_ids: Molecule ids for each train/val/test split.
+    - split_ids_by_dataset: Molecule ids for each split grouped by dataset id.
     - molecules: Mapping from molecule id to processed molecule object.
     """
 
     split_ids: Dict[str, List[str]]
     molecules: Dict[str, ProcessedMolecule]
+    dataset_ids: Optional[List[str]] = None
+    split_ids_by_dataset: Optional[Dict[str, Dict[str, List[str]]]] = None
 
 
 @dataclass
@@ -199,6 +232,7 @@ class PackedMoleculeChunk:
     Store one offline-packed single-molecule chunk for direct training loads.
 
     Arguments:
+    - dataset_id: Source dataset identifier for the parent molecule.
     - molecule_id: Parent molecule identifier.
     - chunk_index: Chunk index inside the parent molecule.
     - num_chunks: Total number of chunks for the parent molecule.
@@ -234,6 +268,8 @@ class PackedMoleculeChunk:
     - active_rumer_n_node: Active orbital counts for each structure graph, shape [num_structures].
     - active_rumer_n_edge: Active-only Rumer edge counts for each structure graph, shape [num_structures].
     - targets: Packed normalized targets for all structures in the chunk, shape [num_structures].
+    - top_mass_focus_mask: Packed binary focus-set mask for all structures in the
+      chunk, shape [num_structures]. Older caches may omit this field.
     """
 
     molecule_id: str
@@ -267,6 +303,60 @@ class PackedMoleculeChunk:
     active_rumer_n_node: np.ndarray
     active_rumer_n_edge: np.ndarray
     targets: np.ndarray
+    top_mass_focus_mask: Optional[np.ndarray] = None
+    dataset_id: str = "default"
+
+
+@dataclass
+class PackedChunkReference:
+    """
+    Store one lightweight reference to an offline-packed single-molecule chunk.
+
+    Arguments:
+    - dataset_id: Source dataset identifier for the parent molecule.
+    - molecule_id: Parent molecule identifier.
+    - chunk_index: Chunk index inside the parent molecule.
+    - num_chunks: Total number of chunks for the parent molecule.
+    - chunk_path: On-disk pickle path for this chunk payload.
+    - num_structures: Number of VB structures stored in this chunk.
+    - total_atoms: Total packed atom nodes across all structure graphs in this chunk.
+    - total_orbitals: Total packed orbital nodes across all structure graphs in this chunk.
+    """
+
+    molecule_id: str
+    chunk_index: int
+    num_chunks: int
+    chunk_path: str
+    num_structures: int
+    total_atoms: int
+    total_orbitals: int
+    dataset_id: str = "default"
+
+
+@dataclass
+class FixedBucketSpec:
+    """
+    Store coarse fixed padding targets for one runtime batch.
+
+    Arguments:
+    - total_graphs: Padded number of per-structure graphs.
+    - total_static_atoms: Padded number of molecule-static atoms.
+    - total_atoms: Padded number of expanded atom nodes.
+    - total_atom_edges: Padded number of atom edges.
+    - total_orbitals: Padded number of full orbital nodes.
+    - total_rumer_edges: Padded number of full Rumer edges.
+    - total_active_orbitals: Padded number of active orbital nodes.
+    - total_active_rumer_edges: Padded number of active-only Rumer edges.
+    """
+
+    total_graphs: int
+    total_static_atoms: int
+    total_atoms: int
+    total_atom_edges: int
+    total_orbitals: int
+    total_rumer_edges: int
+    total_active_orbitals: int
+    total_active_rumer_edges: int
 
 
 @dataclass
@@ -275,14 +365,38 @@ class PackedDatasetCache:
     Store offline-packed split chunks for direct train/eval loading.
 
     Arguments:
+    - dataset_ids: Ordered dataset identifiers included in this cache.
     - split_ids: Molecule ids for each train/val/test split.
+    - split_ids_by_dataset: Molecule ids for each split grouped by dataset id.
     - split_structure_counts: Structure counts for each split.
-    - packed_chunks: Mapping from split name to packed single-molecule chunks.
+    - split_structure_counts_by_dataset: Structure counts for each split grouped
+      by dataset id.
+    - packed_chunks: Optional legacy in-memory mapping from split name to packed
+      single-molecule chunks.
+    - packed_chunk_refs: Optional mapping from split name to lightweight chunk
+      references used for streaming loads.
     """
 
     split_ids: Dict[str, List[str]]
     split_structure_counts: Dict[str, int]
-    packed_chunks: Dict[str, List[PackedMoleculeChunk]]
+    packed_chunks: Optional[Dict[str, List[PackedMoleculeChunk]]] = None
+    packed_chunk_refs: Optional[Dict[str, List[PackedChunkReference]]] = None
+    dataset_ids: Optional[List[str]] = None
+    split_ids_by_dataset: Optional[Dict[str, Dict[str, List[str]]]] = None
+    split_structure_counts_by_dataset: Optional[Dict[str, Dict[str, int]]] = None
+
+    def splitChunks(self, split_name: str) -> List[PackedMoleculeChunk | PackedChunkReference]:
+        """
+        Return chunk records for one split, preferring lightweight references.
+        """
+
+        packed_chunk_refs = getattr(self, "packed_chunk_refs", None)
+        if packed_chunk_refs is not None:
+            return list(packed_chunk_refs[split_name])
+        packed_chunks = getattr(self, "packed_chunks", None)
+        if packed_chunks is not None:
+            return list(packed_chunks[split_name])
+        raise ValueError("PackedDatasetCache does not contain any packed chunk records.")
 
 
 @jax.tree_util.register_pytree_node_class
@@ -300,8 +414,6 @@ class UnifiedBatch:
     - atom_graph: Batched atom graph as jraph.GraphsTuple.
       nodes:
         features [total_atoms, 3]
-        numbers [total_atoms]
-        positions [total_atoms, 3]
       edges:
         pair [total_atom_edges, 2]
     - rumer_graph: Batched Rumer graph as jraph.GraphsTuple.
@@ -322,14 +434,25 @@ class UnifiedBatch:
     - lap_evals: Batched node-aligned repeated Laplacian eigenvalues,
       shape [total_atoms, lap_pe_k].
     - lap_evecs: Batched Laplacian eigenvectors, shape [total_atoms, lap_pe_k].
+    - expanded_atom_to_static_atom_index: Gather indices mapping each expanded
+      atom-graph node to one molecule-static atom row, shape [total_atoms].
+    - static_atom_numbers: Molecule-static atomic numbers stored once per chunk,
+      shape [total_static_atoms].
+    - static_atom_positions: Molecule-static coordinates stored once per chunk,
+      shape [total_static_atoms, 3].
     - num_atoms_per_graph: Atom node count for each graph, shape [batch_size].
     - num_orbitals_per_graph: Orbital node count for each graph, shape [batch_size].
     - num_structures_per_molecule: Structure counts for each molecule in the batch.
+    - dataset_index_per_molecule: Dataset indices aligned with
+      ``num_structures_per_molecule``. Padded molecule slots use ``-1``.
     - num_molecules_in_batch: Number of molecules in the current batch.
-    - local_frame_e1: Cached local frame axis e1, shape [total_atoms, 3].
-    - local_frame_e2: Cached local frame axis e2, shape [total_atoms, 3].
-    - local_frame_e3: Cached local frame axis e3, shape [total_atoms, 3].
+    - local_frame_e1: Molecule-static cached local frame axis e1, shape [total_static_atoms, 3].
+    - local_frame_e2: Molecule-static cached local frame axis e2, shape [total_static_atoms, 3].
+    - local_frame_e3: Molecule-static cached local frame axis e3, shape [total_static_atoms, 3].
+    - top_mass_focus_mask: Binary mask selecting structures that belong to the
+      molecule-local cumulative-mass focus set, shape [batch_size].
     - targets: Normalized targets, shape [batch_size].
+    - sample_mask: Mask selecting real structure graphs, shape [batch_size].
     """
 
     atom_graph: jraph.GraphsTuple
@@ -341,14 +464,20 @@ class UnifiedBatch:
     active_orbital_index: jnp.ndarray
     lap_evals: jnp.ndarray
     lap_evecs: jnp.ndarray
+    expanded_atom_to_static_atom_index: jnp.ndarray
+    static_atom_numbers: jnp.ndarray
+    static_atom_positions: jnp.ndarray
     num_atoms_per_graph: jnp.ndarray
     num_orbitals_per_graph: jnp.ndarray
     num_structures_per_molecule: jnp.ndarray
+    dataset_index_per_molecule: jnp.ndarray
     num_molecules_in_batch: int
     local_frame_e1: jnp.ndarray
     local_frame_e2: jnp.ndarray
     local_frame_e3: jnp.ndarray
+    top_mass_focus_mask: jnp.ndarray
     targets: jnp.ndarray
+    sample_mask: jnp.ndarray
 
     def tree_flatten(self):
         """
@@ -365,13 +494,19 @@ class UnifiedBatch:
             self.active_orbital_index,
             self.lap_evals,
             self.lap_evecs,
+            self.expanded_atom_to_static_atom_index,
+            self.static_atom_numbers,
+            self.static_atom_positions,
             self.num_atoms_per_graph,
             self.num_orbitals_per_graph,
             self.num_structures_per_molecule,
+            self.dataset_index_per_molecule,
             self.local_frame_e1,
             self.local_frame_e2,
             self.local_frame_e3,
+            self.top_mass_focus_mask,
             self.targets,
+            self.sample_mask,
         )
         aux_data = {"num_molecules_in_batch": self.num_molecules_in_batch}
         return children, aux_data
@@ -392,12 +527,18 @@ class UnifiedBatch:
             active_orbital_index=children[6],
             lap_evals=children[7],
             lap_evecs=children[8],
-            num_atoms_per_graph=children[9],
-            num_orbitals_per_graph=children[10],
-            num_structures_per_molecule=children[11],
+            expanded_atom_to_static_atom_index=children[9],
+            static_atom_numbers=children[10],
+            static_atom_positions=children[11],
+            num_atoms_per_graph=children[12],
+            num_orbitals_per_graph=children[13],
+            num_structures_per_molecule=children[14],
+            dataset_index_per_molecule=children[15],
             num_molecules_in_batch=aux_data["num_molecules_in_batch"],
-            local_frame_e1=children[12],
-            local_frame_e2=children[13],
-            local_frame_e3=children[14],
-            targets=children[15],
+            local_frame_e1=children[16],
+            local_frame_e2=children[17],
+            local_frame_e3=children[18],
+            top_mass_focus_mask=children[19],
+            targets=children[20],
+            sample_mask=children[21],
         )

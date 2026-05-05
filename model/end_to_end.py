@@ -100,8 +100,15 @@ class EndToEndE3VBModel(nnx.Module):
         Run forward prediction together with auxiliary regularization terms.
         """
 
+        expanded_atom_numbers = batch.static_atom_numbers[batch.expanded_atom_to_static_atom_index]
+        expanded_atom_positions = batch.static_atom_positions[batch.expanded_atom_to_static_atom_index]
+        expanded_local_frame_e1 = batch.local_frame_e1[batch.expanded_atom_to_static_atom_index]
+        expanded_local_frame_e2 = batch.local_frame_e2[batch.expanded_atom_to_static_atom_index]
+        expanded_local_frame_e3 = batch.local_frame_e3[batch.expanded_atom_to_static_atom_index]
         atom_output = self.atom_encoder(
             batch.atom_graph,
+            atom_number=expanded_atom_numbers,
+            positions=expanded_atom_positions,
             lap_evecs=batch.lap_evecs,
             lap_evals=batch.lap_evals,
         )
@@ -113,9 +120,9 @@ class EndToEndE3VBModel(nnx.Module):
             orbital_atom_index=batch.orbital_atom_index,
             orbital_role=batch.orbital_role,
             active_slot_index=batch.active_slot_index,
-            local_frame_e1=batch.local_frame_e1,
-            local_frame_e2=batch.local_frame_e2,
-            local_frame_e3=batch.local_frame_e3,
+            local_frame_e1=expanded_local_frame_e1,
+            local_frame_e2=expanded_local_frame_e2,
+            local_frame_e3=expanded_local_frame_e3,
         )
         slot_diversity_penalty = self.slotDiversityPenalty(
             slot_alpha=projection_output["slot_alpha"],

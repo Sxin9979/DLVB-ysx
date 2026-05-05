@@ -2,7 +2,7 @@
 
 from utils.checkpoint import NNXCheckpointManager
 from utils.config import ConfigFactory, ExperimentConfig, TrainingConfig
-from utils.losses import pairwiseRankLoss, weightedMae
+from utils.losses import pairwiseRankLoss, topMassObjectiveLoss, weightedMae
 from utils.metrics import RegressionMetrics
 
 __all__ = [
@@ -11,6 +11,7 @@ __all__ = [
     "NNXCheckpointManager",
     "pairwiseRankLoss",
     "RegressionMetrics",
+    "topMassObjectiveLoss",
     "TrainingConfig",
     "weightedMae",
 ]

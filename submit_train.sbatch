@@ -20,8 +20,6 @@ RUN_TAG="${RUN_MODE}_${JOB_ID}"
 TRAIN_LOG="${PROJECT_ROOT}/logs/${RUN_TAG}.log"
 GPU_LOG="${PROJECT_ROOT}/logs/${RUN_TAG}.gpu.csv"
 CHECKPOINT_PATH="${PROJECT_ROOT}/checkpoints/${RUN_TAG}_best.pkl"
-PROCESSED_CACHE="${PROJECT_ROOT}/processed/processed_dataset_cache.pkl"
-PACKED_CACHE="${PROJECT_ROOT}/processed/packed_dataset_cache.pkl"
 mkdir -p "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/checkpoints"
 
 source ~/.bashrc
@@ -29,6 +27,21 @@ source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 conda activate "${ENV_NAME}"
 
 cd "${PROJECT_ROOT}"
+
+readarray -t CACHE_INFO < <(
+python - "${CONFIG_PATH}" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = yaml.safe_load(handle)
+data = payload["data"]
+print(data["processed_cache_path"])
+print(data["packed_cache_path"])
+PY
+)
+PROCESSED_CACHE="${CACHE_INFO[0]}"
+PACKED_CACHE="${CACHE_INFO[1]}"
 
 # pc001 shells may inherit a broken localhost proxy; disable it inside the job.
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy

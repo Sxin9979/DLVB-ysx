@@ -1,0 +1,99 @@
+data:
+  seed: 0
+  split: [0.8, 0.1, 0.1]
+  datasets:
+    - dataset_id: checked
+      xmo_dir: /pool1/home/ysxin/autovb_newoutfile/checked_outfile
+    - dataset_id: vb
+      xmo_dir: /pool1/home/ysxin/E3nnVB/VB/out_file
+  processed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/processed_dataset_cache_checked_vb_unified.pkl
+  packed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/packed_dataset_cache_checked_vb_unified.pkl
+  max_structures_per_chunk: 16
+
+model:
+  atom:
+    input_feature_dim: 3
+    scalar_dim: 128
+    vector_dim: 32
+    radial_dim: 64
+    layers: 4
+    max_atomic_number: 128
+    radial_min: 0.0
+    radial_max: 2.0
+    radial_basis: 64
+    lmax: 1
+    lap_pe_k: 8
+    signnet:
+      phi_hidden: 64
+      phi_out: 16
+      phi_layers: 2
+      rho_hidden: 128
+      out_dim: 32
+      rho_layers: 2
+
+  orbital:
+    scalar_dim: 128
+    vector_dim: 32
+    slot_dim: 128
+    slot_query_dim: 128
+    slot_embedding_dim: 32
+    max_active_slots: 8
+    orbital_feature_dim: 128
+
+  rumer:
+    orbital_feature_dim: 128
+    hidden_dim: 128
+    edge_embedding_dim: 16
+    layers: 3
+    mode: active_only_low_risk
+
+training:
+  seed: 0
+  batch_size: 8
+  epochs: 1200
+  learning_rate: 1.0e-3
+  min_learning_rate: 1.0e-6
+  weight_decay: 1.0e-5
+  early_stopping_patience: 60
+  early_stopping_start_epoch: 120
+  bucketed_batching: true
+  bucket_key: num_atoms_num_orbitals
+  train_drop_remainder: false
+  fixed_bucket_batching: true
+  fixed_bucket_graph_step: 8
+  fixed_bucket_static_atom_step: 16
+  fixed_bucket_atom_step: 128
+  fixed_bucket_atom_edge_step: 1024
+  fixed_bucket_orbital_step: 256
+  fixed_bucket_rumer_edge_step: 2048
+  fixed_bucket_active_orbital_step: 64
+  fixed_bucket_active_edge_step: 512
+  eval_interval_epochs: 5
+  test_on_best_only: true
+  batch_log_interval: 20
+  iterator_log_interval: 20
+  slot_diversity_weight: 1.0e-2
+  target_weight_power: 0.5
+  target_weight_offset: 0.02
+  rank_loss_weight: 0.0
+  rank_loss_margin: 0.02
+  rank_loss_min_delta: 0.01
+  rank_pair_power: 1.0
+  use_top_mass_objective: true
+  focus_cumulative_mass: 0.98
+  validation_monitor: macro_focus_priority_score
+  focus_monitor_pair_acc_weight: 0.15
+  focus_monitor_spearman_weight: 0.10
+  focus_monitor_recall_weight: 0.05
+  focus_monitor_precision_weight: 0.15
+  focus_monitor_tail_fpr_weight: 0.10
+  top_mass_regression_weight: 1.0
+  top_mass_ranking_weight: 0.35
+  tail_suppression_weight: 0.05
+  top_mass_sample_strategy: focus_plus_mixed_tail
+  mixed_tail_top_fraction: 0.5
+  max_tail_samples_per_molecule: 96
+  molecule_balanced_sampling: true
+  dataset_sampling_strategy: balanced
+  checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/checkpoints/best_e2e_checked_vb_unified_topmass_lowmem.pkl
+  log_path: /pool1/home/ysxin/E3nn/E3VB/logs/train_e2e_checked_vb_unified_topmass_lowmem.log

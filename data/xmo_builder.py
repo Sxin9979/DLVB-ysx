@@ -11,6 +11,37 @@ from data.schema import ProcessedMolecule, ProcessedStructureSample
 from data.xmo_parser import ParsedXMOMolecule
 
 
+def computeTopMassFocusMaskLocal(
+    target: np.ndarray,
+    cumulative_mass: float,
+) -> np.ndarray:
+    """
+    Mark the smallest prefix whose cumulative target mass reaches the threshold.
+
+    This local helper intentionally avoids importing the ``utils`` package
+    during preprocessing so the data module does not create a circular import.
+    """
+
+    target = np.asarray(target, dtype=np.float32)
+    cumulative_mass = float(np.clip(cumulative_mass, 0.0, 1.0))
+    focus_mask = np.zeros_like(target, dtype=np.float32)
+    if target.shape[0] == 0:
+        return focus_mask
+
+    valid_target = np.maximum(target, 0.0)
+    order = np.argsort(valid_target)[::-1]
+    ordered_target = valid_target[order]
+    total_mass = float(np.sum(ordered_target))
+    if total_mass <= 1.0e-12:
+        focus_mask[order[:1]] = 1.0
+        return focus_mask
+
+    running = np.cumsum(ordered_target)
+    focus_count = int(np.searchsorted(running, cumulative_mass * total_mass, side="left")) + 1
+    focus_mask[order[:focus_count]] = 1.0
+    return focus_mask
+
+
 @dataclass
 class BuiltMoleculeSample:
     """Structured molecule-level sample produced from one parsed ``.xmo`` file."""
@@ -391,6 +422,10 @@ class XmoFeatureBuilder:
         weight_array = np.asarray([structure.lowdin_weight for structure in parsed.structures], dtype=np.float32)
         weight_max = float(np.max(weight_array))
         normalized_weight = weight_array / max(weight_max, 1e-12)
+        top_mass_focus_mask = computeTopMassFocusMaskLocal(
+            target=normalized_weight,
+            cumulative_mass=0.98,
+        )
 
         structures: list[ProcessedStructureSample] = []
         edge_cursor = 0
@@ -447,6 +482,7 @@ class XmoFeatureBuilder:
                     active_rumer_edge_type=active_rumer_edge_type,
                     target=float(normalized_weight[structure_index]),
                     target_max=weight_max,
+                    top_mass_focus=float(top_mass_focus_mask[structure_index]),
                 )
             )
 

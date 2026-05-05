@@ -2,6 +2,8 @@
 
 from data.processor import UnifiedDataConfig, UnifiedSampleProcessor, XmoDatasetProcessor
 from data.schema import (
+    DatasetSourceConfig,
+    PackedChunkReference,
     PackedDatasetCache,
     PackedMoleculeChunk,
     ProcessedDatasetCache,
@@ -18,6 +20,8 @@ from data.xmo_parser import ParsedVBStructure, ParsedXMOMolecule, XmoParser
 __all__ = [
     "GrainPipeline",
     "GraphPackingAdapter",
+    "DatasetSourceConfig",
+    "PackedChunkReference",
     "PackedDatasetCache",
     "PackedMoleculeChunk",
     "ProcessedDatasetCache",

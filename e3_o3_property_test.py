@@ -12,7 +12,7 @@ import yaml
 from data import GraphPackingAdapter, UnifiedSampleProcessor
 from data.schema import UnifiedBatch
 from model.end_to_end import EndToEndE3VBModel
-from utils import ConfigFactory
+from utils import ConfigFactory, NNXCheckpointManager
 
 
 @dataclass
@@ -116,13 +116,8 @@ class GeometryTransformSuite:
         - New UnifiedBatch with transformed atom positions.
         """
 
-        original_nodes = batch.atom_graph.nodes
-        transformed_positions = original_nodes["positions"] @ spec.matrix.T + spec.translation[None, :]
-        nodes = dict(original_nodes)
-        nodes["positions"] = transformed_positions
-        atom_graph = batch.atom_graph._replace(nodes=nodes)
         return UnifiedBatch(
-            atom_graph=atom_graph,
+            atom_graph=batch.atom_graph,
             rumer_graph=batch.rumer_graph,
             active_rumer_graph=batch.active_rumer_graph,
             orbital_atom_index=batch.orbital_atom_index,
@@ -131,14 +126,22 @@ class GeometryTransformSuite:
             active_orbital_index=batch.active_orbital_index,
             lap_evals=batch.lap_evals,
             lap_evecs=batch.lap_evecs,
+            expanded_atom_to_static_atom_index=batch.expanded_atom_to_static_atom_index,
+            static_atom_numbers=batch.static_atom_numbers,
+            static_atom_positions=(
+                batch.static_atom_positions @ spec.matrix.T + spec.translation[None, :]
+            ),
             num_atoms_per_graph=batch.num_atoms_per_graph,
             num_orbitals_per_graph=batch.num_orbitals_per_graph,
             num_structures_per_molecule=batch.num_structures_per_molecule,
+            dataset_index_per_molecule=batch.dataset_index_per_molecule,
             num_molecules_in_batch=batch.num_molecules_in_batch,
             local_frame_e1=batch.local_frame_e1 @ spec.matrix.T,
             local_frame_e2=batch.local_frame_e2 @ spec.matrix.T,
             local_frame_e3=batch.local_frame_e3 @ spec.matrix.T,
+            top_mass_focus_mask=batch.top_mass_focus_mask,
             targets=batch.targets,
+            sample_mask=batch.sample_mask,
         )
 
 
@@ -183,7 +186,15 @@ class InvarianceTestRunner:
     Run E(3)/O(3) numerical checks for one sample.
     """
 
-    def __init__(self, config_path: str, split: str, sample_index: int, seed: int, include_reflection: bool):
+    def __init__(
+        self,
+        config_path: str,
+        split: str,
+        sample_index: int,
+        seed: int,
+        include_reflection: bool,
+        checkpoint_path: str | None,
+    ):
         """
         Initialize test runner.
 
@@ -200,6 +211,7 @@ class InvarianceTestRunner:
         self.sample_index = sample_index
         self.seed = seed
         self.include_reflection = include_reflection
+        self.checkpoint_path = checkpoint_path
         self.error = EquivarianceError()
         self.transforms = GeometryTransformSuite()
 
@@ -247,7 +259,19 @@ class InvarianceTestRunner:
         """
 
         rngs = nnx.Rngs(experiment_config.training.seed)
-        return EndToEndE3VBModel(config=experiment_config.model, rngs=rngs)
+        model = EndToEndE3VBModel(config=experiment_config.model, rngs=rngs)
+        if self.checkpoint_path is not None:
+            NNXCheckpointManager().load(model=model, path=self.checkpoint_path)
+        return model
+
+    def expandedAtomInputs(self, batch: UnifiedBatch) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Build expanded atom-number and position inputs exactly as main forward does.
+        """
+
+        expanded_atom_numbers = batch.static_atom_numbers[batch.expanded_atom_to_static_atom_index]
+        expanded_atom_positions = batch.static_atom_positions[batch.expanded_atom_to_static_atom_index]
+        return expanded_atom_numbers, expanded_atom_positions
 
     def transformVector(self, vector_feature: jnp.ndarray, matrix: jnp.ndarray) -> jnp.ndarray:
         """
@@ -282,13 +306,19 @@ class InvarianceTestRunner:
         """
 
         transformed_batch = self.transforms.apply(original_batch, spec)
+        original_atom_numbers, original_positions = self.expandedAtomInputs(original_batch)
+        transformed_atom_numbers, transformed_positions = self.expandedAtomInputs(transformed_batch)
         original_atom = model.atom_encoder(
             original_batch.atom_graph,
+            atom_number=original_atom_numbers,
+            positions=original_positions,
             lap_evecs=original_batch.lap_evecs,
             lap_evals=original_batch.lap_evals,
         )
         transformed_atom = model.atom_encoder(
             transformed_batch.atom_graph,
+            atom_number=transformed_atom_numbers,
+            positions=transformed_positions,
             lap_evecs=transformed_batch.lap_evecs,
             lap_evals=transformed_batch.lap_evals,
         )
@@ -344,6 +374,7 @@ class InvarianceTestRunner:
         print(f"Config: {self.config_path}")
         print(f"Split: {self.split}, Sample Index: {self.sample_index}")
         print(f"Reflection Enabled: {self.include_reflection}")
+        print(f"Checkpoint: {self.checkpoint_path}")
 
         for spec in test_specs:
             self.reportTransform(model=model, original_batch=batch, spec=spec)
@@ -388,6 +419,12 @@ def main() -> None:
         action="store_true",
         help="Disable reflection test.",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional trained checkpoint path. When omitted, test a randomly initialized model.",
+    )
     args = parser.parse_args()
 
     runner = InvarianceTestRunner(
@@ -396,6 +433,7 @@ def main() -> None:
         sample_index=args.sample_index,
         seed=args.seed,
         include_reflection=not args.disable_reflection,
+        checkpoint_path=args.checkpoint,
     )
     runner.run()
 

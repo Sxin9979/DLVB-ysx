@@ -20,6 +20,7 @@ from data.xmo_parser import ParsedXMOMolecule, XmoParser
 from model.end_to_end import EndToEndE3VBModel
 from model.orbital_projection import LocalOrbitalProjector
 from utils import ConfigFactory, NNXCheckpointManager
+from utils.top_mass import buildPredictedTopMassMask
 
 
 @dataclass
@@ -29,7 +30,12 @@ class PredictionRecord:
     vb_index: int
     structure_string: str
     prediction_raw: float
+    prediction_nonnegative: float
     prediction_norm_by_pred_max: float
+    prediction_norm_by_full_sum: float
+    prediction_norm_by_selected_sum: float
+    predicted_global_rank: int
+    predicted_top_mass_focus: bool
 
 
 class Predictor:
@@ -122,6 +128,7 @@ class Predictor:
                     active_rumer_edge_type=structure_sample.active_rumer_edge_type.copy(),
                     target=0.0,
                     target_max=1.0,
+                    top_mass_focus=0.0,
                 )
             )
 
@@ -129,6 +136,23 @@ class Predictor:
         self.molecule_local_frame_e2 = np.tile(local_frame_e2, (len(samples), 1))
         self.molecule_local_frame_e3 = np.tile(local_frame_e3, (len(samples), 1))
         return samples, structure_strings
+
+    def resolveSelectedIndices(
+        self,
+        samples: Sequence[UnifiedSample],
+        vb_indices: Sequence[int] | None,
+    ) -> np.ndarray:
+        """Return sample indices for the requested VB structures."""
+
+        if vb_indices is None:
+            return np.arange(len(samples), dtype=np.int32)
+
+        requested = [int(vb_index) for vb_index in vb_indices]
+        index_by_vb_index = {int(sample.vb_index): index for index, sample in enumerate(samples)}
+        missing = [vb_index for vb_index in requested if vb_index not in index_by_vb_index]
+        if missing:
+            raise ValueError(f"Requested vb_indices were not found in the input molecule: {missing}")
+        return np.asarray([index_by_vb_index[vb_index] for vb_index in requested], dtype=np.int32)
 
     def iterateBatches(self, samples: Sequence[UnifiedSample]):
         """Yield batched samples for one molecule."""
@@ -154,27 +178,53 @@ class Predictor:
             yield start, end, batch
             start = end
 
-    def predictFromParsed(self, parsed: ParsedXMOMolecule) -> list[PredictionRecord]:
+    def predictFromParsed(
+        self,
+        parsed: ParsedXMOMolecule,
+        vb_indices: Sequence[int] | None = None,
+    ) -> list[PredictionRecord]:
         """Run one full-molecule prediction and return ordered rows."""
 
         samples, structure_strings = self.buildSamples(parsed)
+        selected_indices = self.resolveSelectedIndices(samples=samples, vb_indices=vb_indices)
         predictions = np.zeros((len(samples),), dtype=np.float32)
 
         for start, end, batch in self.iterateBatches(samples):
             batch_prediction = np.asarray(self.model(batch), dtype=np.float32)
             predictions[start:end] = batch_prediction
 
+        nonnegative_prediction = np.maximum(predictions, 0.0)
         pred_max = float(np.max(predictions)) if len(predictions) > 0 else 1.0
         pred_scale = pred_max if abs(pred_max) > 1.0e-12 else 1.0
+        full_sum = float(np.sum(nonnegative_prediction))
+        full_scale = full_sum if full_sum > 1.0e-12 else 1.0
+        selected_nonnegative_prediction = nonnegative_prediction[selected_indices]
+        selected_sum = float(np.sum(selected_nonnegative_prediction))
+        selected_scale = selected_sum if selected_sum > 1.0e-12 else 1.0
+        predicted_focus_mask = buildPredictedTopMassMask(
+            prediction=nonnegative_prediction,
+            num_structures_per_molecule=[len(samples)],
+            cumulative_mass=float(self.config.training.focus_cumulative_mass),
+        ) > 0.5
+        ranking_order = np.argsort(predictions)[::-1]
+        global_rank = np.empty((len(samples),), dtype=np.int32)
+        global_rank[ranking_order] = np.arange(1, len(samples) + 1, dtype=np.int32)
 
         return [
             PredictionRecord(
-                vb_index=samples[index].vb_index,
-                structure_string=structure_strings[index],
-                prediction_raw=float(predictions[index]),
-                prediction_norm_by_pred_max=float(predictions[index] / pred_scale),
+                vb_index=samples[int(index)].vb_index,
+                structure_string=structure_strings[int(index)],
+                prediction_raw=float(predictions[int(index)]),
+                prediction_nonnegative=float(nonnegative_prediction[int(index)]),
+                prediction_norm_by_pred_max=float(predictions[int(index)] / pred_scale),
+                prediction_norm_by_full_sum=float(nonnegative_prediction[int(index)] / full_scale),
+                prediction_norm_by_selected_sum=float(
+                    nonnegative_prediction[int(index)] / selected_scale
+                ),
+                predicted_global_rank=int(global_rank[int(index)]),
+                predicted_top_mass_focus=bool(predicted_focus_mask[int(index)]),
             )
-            for index in range(len(samples))
+            for index in selected_indices.tolist()
         ]
 
     def predict(
@@ -182,11 +232,23 @@ class Predictor:
         xmo_path: str | None = None,
         xmi_path: str | None = None,
         str_path: str | None = None,
+        vb_indices: Sequence[int] | None = None,
     ) -> tuple[ParsedXMOMolecule, list[PredictionRecord]]:
         """Parse input, run prediction, and return results."""
 
         parsed = self.parseInput(xmo_path=xmo_path, xmi_path=xmi_path, str_path=str_path)
-        return parsed, self.predictFromParsed(parsed)
+        return parsed, self.predictFromParsed(parsed, vb_indices=vb_indices)
+
+
+def parseVbIndices(argument: str | None) -> list[int] | None:
+    """Parse one comma-separated vb index string."""
+
+    if argument is None:
+        return None
+    value = argument.strip()
+    if value == "":
+        return None
+    return [int(token.strip()) for token in value.split(",") if token.strip()]
 
 
 def writePredictionTable(
@@ -202,11 +264,22 @@ def writePredictionTable(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
-        handle.write("molecule_id\tvb_index\tprediction_raw\tprediction_norm_by_pred_max\tstructure_string\n")
+        handle.write(
+            "molecule_id\tvb_index\tprediction_raw\tprediction_nonnegative\t"
+            "prediction_norm_by_pred_max\tprediction_norm_by_full_sum\t"
+            "prediction_norm_by_selected_sum\tpredicted_global_rank\t"
+            "predicted_top_mass_focus\tstructure_string\n"
+        )
         for record in records:
             handle.write(
                 f"{molecule_id}\t{record.vb_index}\t"
-                f"{record.prediction_raw:.10f}\t{record.prediction_norm_by_pred_max:.10f}\t"
+                f"{record.prediction_raw:.10f}\t"
+                f"{record.prediction_nonnegative:.10f}\t"
+                f"{record.prediction_norm_by_pred_max:.10f}\t"
+                f"{record.prediction_norm_by_full_sum:.10f}\t"
+                f"{record.prediction_norm_by_selected_sum:.10f}\t"
+                f"{record.predicted_global_rank}\t"
+                f"{int(record.predicted_top_mass_focus)}\t"
                 f"{record.structure_string}\n"
             )
 
@@ -227,7 +300,10 @@ def printPredictionSummary(
         print(
             f"TOP rank={rank:03d} vb_index={record.vb_index:05d} "
             f"pred_raw={record.prediction_raw:.10f} "
-            f"pred_norm={record.prediction_norm_by_pred_max:.10f} "
+            f"pred_w_full={record.prediction_norm_by_full_sum:.10f} "
+            f"pred_w_sel={record.prediction_norm_by_selected_sum:.10f} "
+            f"global_rank={record.predicted_global_rank:05d} "
+            f"pred_focus={int(record.predicted_top_mass_focus)} "
             f"structure=\"{record.structure_string}\"",
             flush=True,
         )
@@ -285,6 +361,12 @@ def parseArgs() -> argparse.Namespace:
         default=None,
         help="Optional TSV output path for all structure predictions.",
     )
+    parser.add_argument(
+        "--vb_indices",
+        type=str,
+        default=None,
+        help="Optional comma-separated vb indices to score as candidate structures only.",
+    )
     return parser.parse_args()
 
 
@@ -301,6 +383,7 @@ def main() -> None:
         xmo_path=arguments.xmo_path,
         xmi_path=arguments.xmi_path,
         str_path=arguments.str_path,
+        vb_indices=parseVbIndices(arguments.vb_indices),
     )
     printPredictionSummary(
         molecule_id=parsed.molecule_id,

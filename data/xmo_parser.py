@@ -206,24 +206,31 @@ class XmoParser:
         if len(tokens) <= 1:
             return []
 
-        active_tokens = tokens[1:]
-        active_orbitals: list[int] = []
-        for token in active_tokens:
+        active_pairs: list[tuple[int, int]] = []
+        pending_orbital: int | None = None
+        for token in tokens[1:]:
             token = token.strip()
             if not token:
                 continue
-            try:
-                active_orbitals.append(int(token) - 1)
-            except ValueError:
+
+            pair_match = re.fullmatch(r"(\d+)-(\d+)", token)
+            if pair_match is not None:
+                active_pairs.append(
+                    (int(pair_match.group(1)) - 1, int(pair_match.group(2)) - 1)
+                )
                 continue
 
-        if len(active_orbitals) % 2 == 1:
-            active_orbitals = active_orbitals[:-1]
+            if not re.fullmatch(r"\d+", token):
+                continue
 
-        return [
-            (active_orbitals[index], active_orbitals[index + 1])
-            for index in range(0, len(active_orbitals), 2)
-        ]
+            orbital_id = int(token) - 1
+            if pending_orbital is None:
+                pending_orbital = orbital_id
+            else:
+                active_pairs.append((pending_orbital, orbital_id))
+                pending_orbital = None
+
+        return active_pairs
 
     def parseLowdinWeights(self, text: str) -> list[ParsedVBStructure]:
         """Parse all VB structures and their Lowdin weights."""

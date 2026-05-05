@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from data.processor import UnifiedDataConfig
+from data.schema import DatasetSourceConfig
 from model.atom_encoder import AtomEncoderConfig
 from model.end_to_end import EndToEndModelConfig
 from model.orbital_projection import OrbitalProjectionConfig
@@ -28,7 +29,44 @@ class TrainingConfig:
     - bucketed_batching: Whether to bucket training molecule groups by size.
     - bucket_key: Size key used for training molecule buckets.
     - train_drop_remainder: Whether to drop the final short training batch.
+    - fixed_bucket_batching: Whether to pad training batches to coarse fixed buckets.
+    - fixed_bucket_graph_step: Graph-count bucket size.
+    - fixed_bucket_static_atom_step: Static-atom bucket size.
+    - fixed_bucket_atom_step: Expanded atom-node bucket size.
+    - fixed_bucket_atom_edge_step: Atom-edge bucket size.
+    - fixed_bucket_orbital_step: Full-orbital bucket size.
+    - fixed_bucket_rumer_edge_step: Full-Rumer-edge bucket size.
+    - fixed_bucket_active_orbital_step: Active-orbital bucket size.
+    - fixed_bucket_active_edge_step: Active-Rumer-edge bucket size.
+    - eval_interval_epochs: Run validation every N epochs.
+    - test_on_best_only: Whether to run test only when validation improves.
+    - batch_log_interval: Emit split-batch logs every N batches.
+    - iterator_log_interval: Emit iterator-stage logs every N batches.
     - slot_diversity_weight: Weight applied to slot-collapse regularization during training.
+    - use_top_mass_objective: Whether to optimize the high-near-degeneracy top-mass task.
+    - focus_cumulative_mass: Per-molecule cumulative target mass used to define the focus set.
+    - validation_monitor: Validation metric used for checkpointing / early stopping.
+    - focus_monitor_pair_acc_weight: Weight for the focus-set pair-accuracy term in the
+      composite top-mass monitor.
+    - focus_monitor_spearman_weight: Weight for the focus-set Spearman term in the
+      composite top-mass monitor.
+    - focus_monitor_recall_weight: Weight for the focus-set recall term in the
+      composite top-mass monitor.
+    - focus_monitor_precision_weight: Weight for the focus-set precision term in the
+      composite top-mass monitor.
+    - focus_monitor_tail_fpr_weight: Weight for the tail false-positive term in the
+      composite top-mass monitor.
+    - top_mass_regression_weight: Weight applied to focus-set regression.
+    - top_mass_ranking_weight: Weight applied to focus-set and focus-vs-tail ranking.
+    - tail_suppression_weight: Weight applied to low-priority tail regression suppression.
+    - top_mass_sample_strategy: Runtime per-molecule structure sampling policy for top-mass training.
+    - mixed_tail_top_fraction: Fraction of sampled tail slots reserved for the
+      hardest tail examples when using ``focus_plus_mixed_tail``.
+    - max_tail_samples_per_molecule: Optional cap on sampled tail structures during top-mass training.
+    - molecule_balanced_sampling: Whether to batch runtime data by molecule instead of packed chunk.
+    - dataset_sampling_strategy: Dataset-level training sampler. ``natural`` keeps
+      dataset frequency proportional to molecule count while ``balanced`` interleaves
+      batches across datasets.
     - checkpoint_path: File path for best checkpoint.
     - log_path: Optional file path for training log output.
     """
@@ -44,6 +82,19 @@ class TrainingConfig:
     bucketed_batching: bool
     bucket_key: str
     train_drop_remainder: bool
+    fixed_bucket_batching: bool
+    fixed_bucket_graph_step: int
+    fixed_bucket_static_atom_step: int
+    fixed_bucket_atom_step: int
+    fixed_bucket_atom_edge_step: int
+    fixed_bucket_orbital_step: int
+    fixed_bucket_rumer_edge_step: int
+    fixed_bucket_active_orbital_step: int
+    fixed_bucket_active_edge_step: int
+    eval_interval_epochs: int
+    test_on_best_only: bool
+    batch_log_interval: int
+    iterator_log_interval: int
     slot_diversity_weight: float
     target_weight_power: float
     target_weight_offset: float
@@ -51,6 +102,22 @@ class TrainingConfig:
     rank_loss_margin: float
     rank_loss_min_delta: float
     rank_pair_power: float
+    use_top_mass_objective: bool
+    focus_cumulative_mass: float
+    validation_monitor: str
+    focus_monitor_pair_acc_weight: float
+    focus_monitor_spearman_weight: float
+    focus_monitor_recall_weight: float
+    focus_monitor_precision_weight: float
+    focus_monitor_tail_fpr_weight: float
+    top_mass_regression_weight: float
+    top_mass_ranking_weight: float
+    tail_suppression_weight: float
+    top_mass_sample_strategy: str
+    mixed_tail_top_fraction: float
+    max_tail_samples_per_molecule: Optional[int]
+    molecule_balanced_sampling: bool
+    dataset_sampling_strategy: str
     checkpoint_path: str
     log_path: Optional[str]
 
@@ -95,8 +162,31 @@ class ConfigFactory:
         """
 
         data_payload = self.payload["data"]
+        datasets_payload = data_payload.get("datasets")
+        datasets = None
+        xmo_dir = data_payload.get("xmo_dir")
+        if datasets_payload is not None:
+            datasets = tuple(
+                DatasetSourceConfig(
+                    dataset_id=str(entry["dataset_id"]),
+                    xmo_dir=str(entry["xmo_dir"]),
+                    split=(
+                        None
+                        if entry.get("split") is None
+                        else tuple(float(x) for x in entry["split"])
+                    ),
+                )
+                for entry in datasets_payload
+            )
+            if len(datasets) == 0:
+                raise ValueError("data.datasets must contain at least one dataset entry.")
+            dataset_ids = [dataset.dataset_id for dataset in datasets]
+            if len(set(dataset_ids)) != len(dataset_ids):
+                raise ValueError(f"data.datasets contains duplicate dataset_id values: {dataset_ids}")
+        elif xmo_dir is None:
+            raise ValueError("data must define either xmo_dir or datasets.")
         return UnifiedDataConfig(
-            xmo_dir=str(data_payload["xmo_dir"]),
+            xmo_dir=None if xmo_dir is None else str(xmo_dir),
             seed=int(data_payload["seed"]),
             split=tuple(float(x) for x in data_payload["split"]),
             processed_cache_path=(
@@ -115,6 +205,7 @@ class ConfigFactory:
                 else int(data_payload["max_structures_per_chunk"])
             ),
             lap_pe_k=int(self.payload["model"]["atom"].get("lap_pe_k", 0)),
+            datasets=datasets,
         )
 
     def createAtomConfig(self) -> AtomEncoderConfig:
@@ -248,6 +339,43 @@ class ConfigFactory:
                 "training.batch_size must be at least 2 so molecule mini-batching "
                 "does not degenerate to single-molecule updates."
             )
+        use_top_mass_objective = bool(training_payload.get("use_top_mass_objective", False))
+        validation_monitor = str(
+            training_payload.get(
+                "validation_monitor",
+                "focus_weighted_mae" if use_top_mass_objective else "mae",
+            )
+        )
+        valid_validation_monitors = {
+            "mae",
+            "macro_mae",
+            "focus_weighted_mae",
+            "focus_priority_score",
+            "macro_focus_weighted_mae",
+            "macro_focus_priority_score",
+        }
+        if validation_monitor not in valid_validation_monitors:
+            raise ValueError(
+                "training.validation_monitor must be one of "
+                f"{sorted(valid_validation_monitors)}, got {validation_monitor}."
+            )
+        if (validation_monitor != "mae") and (not use_top_mass_objective):
+            if validation_monitor != "macro_mae":
+                raise ValueError(
+                    "training.validation_monitor can only use focus-* metrics when "
+                    "training.use_top_mass_objective is true."
+                )
+        dataset_sampling_strategy = str(training_payload.get("dataset_sampling_strategy", "natural"))
+        valid_dataset_sampling_strategies = {
+            "natural",
+            "balanced",
+        }
+        if dataset_sampling_strategy not in valid_dataset_sampling_strategies:
+            raise ValueError(
+                "training.dataset_sampling_strategy must be one of "
+                f"{sorted(valid_dataset_sampling_strategies)}, got {dataset_sampling_strategy}."
+            )
+
         return TrainingConfig(
             seed=int(training_payload["seed"]),
             batch_size=batch_size,
@@ -260,6 +388,19 @@ class ConfigFactory:
             bucketed_batching=bool(training_payload.get("bucketed_batching", True)),
             bucket_key=bucket_key,
             train_drop_remainder=bool(training_payload.get("train_drop_remainder", True)),
+            fixed_bucket_batching=bool(training_payload.get("fixed_bucket_batching", False)),
+            fixed_bucket_graph_step=int(training_payload.get("fixed_bucket_graph_step", 16)),
+            fixed_bucket_static_atom_step=int(training_payload.get("fixed_bucket_static_atom_step", 32)),
+            fixed_bucket_atom_step=int(training_payload.get("fixed_bucket_atom_step", 256)),
+            fixed_bucket_atom_edge_step=int(training_payload.get("fixed_bucket_atom_edge_step", 2048)),
+            fixed_bucket_orbital_step=int(training_payload.get("fixed_bucket_orbital_step", 512)),
+            fixed_bucket_rumer_edge_step=int(training_payload.get("fixed_bucket_rumer_edge_step", 4096)),
+            fixed_bucket_active_orbital_step=int(training_payload.get("fixed_bucket_active_orbital_step", 128)),
+            fixed_bucket_active_edge_step=int(training_payload.get("fixed_bucket_active_edge_step", 1024)),
+            eval_interval_epochs=max(1, int(training_payload.get("eval_interval_epochs", 1))),
+            test_on_best_only=bool(training_payload.get("test_on_best_only", False)),
+            batch_log_interval=max(1, int(training_payload.get("batch_log_interval", 1))),
+            iterator_log_interval=max(1, int(training_payload.get("iterator_log_interval", 1))),
             slot_diversity_weight=float(training_payload.get("slot_diversity_weight", 0.0)),
             target_weight_power=float(training_payload.get("target_weight_power", 0.0)),
             target_weight_offset=float(training_payload.get("target_weight_offset", 0.0)),
@@ -267,6 +408,38 @@ class ConfigFactory:
             rank_loss_margin=float(training_payload.get("rank_loss_margin", 0.0)),
             rank_loss_min_delta=float(training_payload.get("rank_loss_min_delta", 0.0)),
             rank_pair_power=float(training_payload.get("rank_pair_power", 1.0)),
+            use_top_mass_objective=use_top_mass_objective,
+            focus_cumulative_mass=float(training_payload.get("focus_cumulative_mass", 0.98)),
+            validation_monitor=validation_monitor,
+            focus_monitor_pair_acc_weight=float(
+                training_payload.get("focus_monitor_pair_acc_weight", 0.0)
+            ),
+            focus_monitor_spearman_weight=float(
+                training_payload.get("focus_monitor_spearman_weight", 0.0)
+            ),
+            focus_monitor_recall_weight=float(
+                training_payload.get("focus_monitor_recall_weight", 0.0)
+            ),
+            focus_monitor_precision_weight=float(
+                training_payload.get("focus_monitor_precision_weight", 0.0)
+            ),
+            focus_monitor_tail_fpr_weight=float(
+                training_payload.get("focus_monitor_tail_fpr_weight", 0.0)
+            ),
+            top_mass_regression_weight=float(training_payload.get("top_mass_regression_weight", 1.0)),
+            top_mass_ranking_weight=float(training_payload.get("top_mass_ranking_weight", 0.0)),
+            tail_suppression_weight=float(training_payload.get("tail_suppression_weight", 0.0)),
+            top_mass_sample_strategy=str(
+                training_payload.get("top_mass_sample_strategy", "focus_plus_random_tail")
+            ),
+            mixed_tail_top_fraction=float(training_payload.get("mixed_tail_top_fraction", 0.5)),
+            max_tail_samples_per_molecule=(
+                None
+                if training_payload.get("max_tail_samples_per_molecule") is None
+                else int(training_payload["max_tail_samples_per_molecule"])
+            ),
+            molecule_balanced_sampling=bool(training_payload.get("molecule_balanced_sampling", False)),
+            dataset_sampling_strategy=dataset_sampling_strategy,
             checkpoint_path=str(training_payload["checkpoint_path"]),
             log_path=(
                 None

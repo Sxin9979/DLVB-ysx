@@ -630,6 +630,8 @@ class AtomE3Encoder(nnx.Module):
     def __call__(
         self,
         atom_graph: jraph.GraphsTuple,
+        atom_number: jnp.ndarray,
+        positions: jnp.ndarray,
         lap_evecs: jnp.ndarray | None = None,
         lap_evals: jnp.ndarray | None = None,
     ) -> dict[str, jnp.ndarray]:
@@ -655,8 +657,6 @@ class AtomE3Encoder(nnx.Module):
         """
 
         atom_feature = atom_graph.nodes["features"]
-        atom_number = atom_graph.nodes["numbers"]
-        positions = atom_graph.nodes["positions"]
         pair_feature = atom_graph.edges["pair"]
         senders = atom_graph.senders
         receivers = atom_graph.receivers
