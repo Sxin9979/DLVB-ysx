@@ -1,9 +1,13 @@
 data:
-  xmo_dir: /pool1/home/ysxin/E3nnVB/VB/out_file
   seed: 0
   split: [0.8, 0.1, 0.1]
-  processed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/processed_dataset_cache_vboutfile.pkl
-  packed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/packed_dataset_cache_vboutfile.pkl
+  datasets:
+    - dataset_id: checked
+      xmo_dir: /pool1/home/ysxin/E3nn/E3VB/tmp_unified_smoke_input/checked
+    - dataset_id: vb
+      xmo_dir: /pool1/home/ysxin/E3nn/E3VB/tmp_unified_smoke_input/vb
+  processed_cache_path: /pool1/home/ysxin/E3nn/E3VB/tmp_preprocess_outputs/processed_dataset_cache_unified_smoke.pkl
+  packed_cache_path: /pool1/home/ysxin/E3nn/E3VB/tmp_preprocess_outputs/packed_dataset_cache_unified_smoke.pkl
   max_structures_per_chunk: 16
 
 model:
@@ -46,7 +50,6 @@ model:
 training:
   seed: 0
   batch_size: 8
-  eval_batch_size: 1
   epochs: 1200
   learning_rate: 1.0e-3
   min_learning_rate: 1.0e-6
@@ -57,14 +60,14 @@ training:
   bucket_key: num_atoms_num_orbitals
   train_drop_remainder: false
   fixed_bucket_batching: true
-  fixed_bucket_graph_step: 8
-  fixed_bucket_static_atom_step: 16
-  fixed_bucket_atom_step: 128
-  fixed_bucket_atom_edge_step: 1024
-  fixed_bucket_orbital_step: 256
-  fixed_bucket_rumer_edge_step: 2048
-  fixed_bucket_active_orbital_step: 64
-  fixed_bucket_active_edge_step: 512
+  fixed_bucket_graph_step: 16
+  fixed_bucket_static_atom_step: 32
+  fixed_bucket_atom_step: 256
+  fixed_bucket_atom_edge_step: 2048
+  fixed_bucket_orbital_step: 512
+  fixed_bucket_rumer_edge_step: 4096
+  fixed_bucket_active_orbital_step: 128
+  fixed_bucket_active_edge_step: 1024
   eval_interval_epochs: 5
   test_on_best_only: true
   batch_log_interval: 20
@@ -78,16 +81,19 @@ training:
   rank_pair_power: 1.0
   use_top_mass_objective: true
   focus_cumulative_mass: 0.98
-  validation_monitor: focus_priority_score
+  validation_monitor: macro_focus_priority_score
   focus_monitor_pair_acc_weight: 0.15
   focus_monitor_spearman_weight: 0.10
-  focus_monitor_recall_weight: 0.10
-  focus_monitor_tail_fpr_weight: 0.05
+  focus_monitor_recall_weight: 0.05
+  focus_monitor_precision_weight: 0.15
+  focus_monitor_tail_fpr_weight: 0.10
   top_mass_regression_weight: 1.0
-  top_mass_ranking_weight: 0.2
+  top_mass_ranking_weight: 0.35
   tail_suppression_weight: 0.05
-  top_mass_sample_strategy: focus_plus_random_tail
-  max_tail_samples_per_molecule: 48
+  top_mass_sample_strategy: focus_plus_mixed_tail
+  mixed_tail_top_fraction: 0.5
+  max_tail_samples_per_molecule: 96
   molecule_balanced_sampling: true
-  checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/checkpoints/best_e2e_vboutfile_topmass_lowmem.pkl
-  log_path: /pool1/home/ysxin/E3nn/E3VB/logs/train_e2e_vboutfile_topmass_lowmem.log
+  dataset_sampling_strategy: balanced
+  checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/tmp_preprocess_outputs/unified_smoke_unused_best.pkl
+  log_path: /pool1/home/ysxin/E3nn/E3VB/tmp_preprocess_outputs/unified_smoke_unused_train.log

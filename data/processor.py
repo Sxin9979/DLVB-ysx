@@ -9,6 +9,14 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+from data.hdf5_io import (
+    chunkDatasetPath,
+    clearPackedChunkStore,
+    isHdf5Path,
+    readPackedCacheMetadata,
+    writePackedCacheMetadata,
+    writePackedChunk,
+)
 from data.lap_pe import lapPeFromEdges
 from data.schema import (
     DatasetSourceConfig,
@@ -150,6 +158,11 @@ class XmoDatasetProcessor:
         path = Path(self.config.packed_cache_path)
         if not path.exists():
             return None
+        if isHdf5Path(path):
+            payload = readPackedCacheMetadata(path)
+            if not isinstance(payload, PackedDatasetCache):
+                raise ValueError(f"Invalid packed cache payload at {path}.")
+            return payload
         with open(path, "rb") as handle:
             payload = pickle.load(handle)
         if not isinstance(payload, PackedDatasetCache):
@@ -161,6 +174,8 @@ class XmoDatasetProcessor:
 
         if self.config.packed_cache_path is None:
             return None
+        if isHdf5Path(self.config.packed_cache_path):
+            return Path(self.config.packed_cache_path)
         cache_path = Path(self.config.packed_cache_path)
         return cache_path.parent / f"{cache_path.stem}_chunks"
 
@@ -170,8 +185,27 @@ class XmoDatasetProcessor:
         chunk_dir = self.packedChunkDirectory()
         if chunk_dir is None:
             raise ValueError("packed_cache_path must be configured before writing packed chunk files.")
+        if isHdf5Path(chunk_dir):
+            raise ValueError("packedChunkPath is only valid for pickle-backed chunk storage.")
         safe_molecule_id = molecule_id.replace("/", "_")
         return chunk_dir / split_name / f"{safe_molecule_id}_chunk{int(chunk_index):04d}.pkl"
+
+    def packedChunkPathForView(
+        self,
+        split_name: str,
+        molecule_id: str,
+        chunk_index: int,
+        view_name: str,
+    ) -> Path:
+        """Build one deterministic file path for a packed chunk payload under one view."""
+
+        chunk_dir = self.packedChunkDirectory()
+        if chunk_dir is None:
+            raise ValueError("packed_cache_path must be configured before writing packed chunk files.")
+        if isHdf5Path(chunk_dir):
+            raise ValueError("packedChunkPathForView is only valid for pickle-backed chunk storage.")
+        safe_molecule_id = molecule_id.replace("/", "_")
+        return chunk_dir / view_name / split_name / f"{safe_molecule_id}_chunk{int(chunk_index):04d}.pkl"
 
     def saveProcessedCache(self, cache: ProcessedDatasetCache) -> None:
         """Persist one processed cache when a target path is configured."""
@@ -190,29 +224,114 @@ class XmoDatasetProcessor:
             return
         path = Path(self.config.packed_cache_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if isHdf5Path(path):
+            writePackedCacheMetadata(path, cache)
+            return
         with open(path, "wb") as handle:
             pickle.dump(cache, handle)
 
-    def savePackedChunk(self, split_name: str, chunk) -> PackedChunkReference:
+    def savePackedChunk(
+        self,
+        split_name: str,
+        chunk,
+        view_name: str = "full",
+    ) -> PackedChunkReference:
         """Persist one packed chunk payload and return a lightweight reference."""
 
-        chunk_path = self.packedChunkPath(
-            split_name=split_name,
-            molecule_id=chunk.molecule_id,
-            chunk_index=chunk.chunk_index,
-        )
-        chunk_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(chunk_path, "wb") as handle:
-            pickle.dump(chunk, handle)
+        if isHdf5Path(self.config.packed_cache_path):
+            chunk_store_path = Path(self.config.packed_cache_path)
+            dataset_path = chunkDatasetPath(
+                split_name=split_name,
+                molecule_id=chunk.molecule_id,
+                chunk_index=chunk.chunk_index,
+                view_name=view_name,
+            )
+            writePackedChunk(chunk_store_path, dataset_path=dataset_path, chunk=chunk)
+            chunk_path_value = str(chunk_store_path)
+            storage_format = "hdf5"
+            hdf5_dataset_path = dataset_path
+        else:
+            chunk_path = self.packedChunkPathForView(
+                split_name=split_name,
+                molecule_id=chunk.molecule_id,
+                chunk_index=chunk.chunk_index,
+                view_name=view_name,
+            )
+            chunk_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(chunk_path, "wb") as handle:
+                pickle.dump(chunk, handle)
+            chunk_path_value = str(chunk_path)
+            storage_format = "pickle"
+            hdf5_dataset_path = None
         return PackedChunkReference(
             molecule_id=chunk.molecule_id,
             chunk_index=int(chunk.chunk_index),
             num_chunks=int(chunk.num_chunks),
-            chunk_path=str(chunk_path),
+            chunk_path=chunk_path_value,
             num_structures=int(chunk.atom_n_node.shape[0]),
+            num_focus_structures=int(
+                np.asarray(
+                    getattr(
+                        chunk,
+                        "top_mass_focus_mask",
+                        np.zeros((int(chunk.atom_n_node.shape[0]),), dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ).sum()
+            ),
+            static_num_atoms=int(np.asarray(chunk.atom_numbers, dtype=np.int32).shape[0]),
             total_atoms=int(np.asarray(chunk.atom_n_node, dtype=np.int32).sum()),
+            total_atom_edges=int(np.asarray(chunk.atom_n_edge, dtype=np.int32).sum()),
             total_orbitals=int(np.asarray(chunk.rumer_n_node, dtype=np.int32).sum()),
+            total_rumer_edges=int(np.asarray(chunk.rumer_n_edge, dtype=np.int32).sum()),
+            total_active_orbitals=int(np.asarray(chunk.active_rumer_n_node, dtype=np.int32).sum()),
+            total_active_rumer_edges=int(np.asarray(chunk.active_rumer_n_edge, dtype=np.int32).sum()),
             dataset_id=str(getattr(chunk, "dataset_id", "default")),
+            storage_format=storage_format,
+            hdf5_dataset_path=hdf5_dataset_path,
+        )
+
+    def selectPackedViewStructures(
+        self,
+        molecule: ProcessedMolecule,
+        view_name: str,
+    ) -> List:
+        """Select one structure list for the requested offline packed view."""
+
+        if view_name == "full":
+            return list(molecule.structures)
+        if view_name == "focus_only":
+            selected = [
+                structure
+                for structure in molecule.structures
+                if float(getattr(structure, "top_mass_focus", 0.0)) > 0.5
+            ]
+            if (len(selected) == 0) and (len(molecule.structures) > 0):
+                selected = [
+                    max(
+                        molecule.structures,
+                        key=lambda structure: float(getattr(structure, "target", 0.0)),
+                    )
+                ]
+            return selected
+        raise ValueError(f"Unsupported packed molecule view: {view_name}")
+
+    def buildPackedViewMolecule(
+        self,
+        molecule: ProcessedMolecule,
+        view_name: str,
+    ) -> ProcessedMolecule:
+        """Build one molecule object whose structures match the requested packed view."""
+
+        return ProcessedMolecule(
+            dataset_id=str(getattr(molecule, "dataset_id", "default")),
+            molecule_id=molecule.molecule_id,
+            atom_numbers=molecule.atom_numbers,
+            atom_positions=molecule.atom_positions,
+            local_frame_e1=molecule.local_frame_e1,
+            local_frame_e2=molecule.local_frame_e2,
+            local_frame_e3=molecule.local_frame_e3,
+            structures=self.selectPackedViewStructures(molecule, view_name=view_name),
         )
 
     def discoverXmoFiles(self, xmo_dir: str | None = None) -> list[Path]:
@@ -251,10 +370,97 @@ class XmoDatasetProcessor:
         orthogonal = reference - float(np.dot(reference, direction)) * direction
         return self.normalizeVector(orthogonal.astype(np.float32))
 
-    def buildLocalFramesForPositions(self, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build one local orthonormal frame per atom from molecular geometry."""
+    def buildActiveAtomMask(
+        self,
+        num_atoms: int,
+        orbital_atom_index: np.ndarray,
+        orbital_role: np.ndarray,
+    ) -> np.ndarray:
+        """Mark atoms that own at least one active orbital."""
+
+        active_mask = np.zeros((num_atoms,), dtype=bool)
+        active_owner = np.asarray(orbital_atom_index, dtype=np.int32)[
+            np.asarray(orbital_role, dtype=np.int32) == 2,
+            0,
+        ]
+        active_mask[np.asarray(active_owner, dtype=np.int32)] = True
+        return active_mask
+
+    def buildStaticBondAdjacency(
+        self,
+        num_atoms: int,
+        structures: list[ProcessedStructureSample],
+    ) -> np.ndarray:
+        """Build one molecule-static undirected adjacency by unioning structure edges."""
+
+        adjacency = np.zeros((num_atoms, num_atoms), dtype=bool)
+        for structure in structures:
+            senders = np.asarray(structure.atom_senders, dtype=np.int32)
+            receivers = np.asarray(structure.atom_receivers, dtype=np.int32)
+            adjacency[senders, receivers] = True
+            adjacency[receivers, senders] = True
+        np.fill_diagonal(adjacency, False)
+        return adjacency
+
+    def orderedFrameNeighborCandidates(
+        self,
+        atom_id: int,
+        distance: np.ndarray,
+        atom_numbers: np.ndarray,
+        active_atom_mask: np.ndarray | None,
+        bonded_adjacency: np.ndarray | None,
+    ) -> list[int]:
+        """Rank frame-defining neighbor candidates by chemistry-aware priority."""
+
+        num_atoms = int(distance.shape[0])
+        heavy_mask = np.asarray(atom_numbers, dtype=np.int32) > 1
+        active_mask = (
+            np.asarray(active_atom_mask, dtype=bool)
+            if active_atom_mask is not None
+            else np.zeros((num_atoms,), dtype=bool)
+        )
+        bonded_mask = (
+            np.asarray(bonded_adjacency[atom_id], dtype=bool)
+            if bonded_adjacency is not None
+            else np.ones((num_atoms,), dtype=bool)
+        )
+        base_mask = np.ones((num_atoms,), dtype=bool)
+        base_mask[atom_id] = False
+
+        priority_masks: list[np.ndarray] = []
+        if bool(active_mask[atom_id]):
+            priority_masks.append(base_mask & bonded_mask & heavy_mask & active_mask)
+        priority_masks.append(base_mask & bonded_mask & heavy_mask)
+        priority_masks.append(base_mask & heavy_mask)
+        priority_masks.append(base_mask & bonded_mask)
+        priority_masks.append(base_mask)
+
+        ordered: list[int] = []
+        seen: set[int] = set()
+        atom_distance = np.asarray(distance[atom_id], dtype=np.float32)
+        for mask in priority_masks:
+            candidate_ids = np.flatnonzero(mask)
+            if candidate_ids.size == 0:
+                continue
+            ranked = candidate_ids[np.argsort(atom_distance[candidate_ids])]
+            for neighbor_id in ranked.tolist():
+                neighbor_id = int(neighbor_id)
+                if neighbor_id not in seen:
+                    ordered.append(neighbor_id)
+                    seen.add(neighbor_id)
+        return ordered
+
+    def buildLocalFramesForPositions(
+        self,
+        positions: np.ndarray,
+        atom_numbers: np.ndarray,
+        active_atom_mask: np.ndarray | None = None,
+        bonded_adjacency: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build one sigma/in-plane/normal frame per atom from geometry and bonded heavy-atom priorities."""
 
         positions = np.asarray(positions, dtype=np.float32)
+        atom_numbers = np.asarray(atom_numbers, dtype=np.int32)
         num_atoms = int(positions.shape[0])
         if num_atoms == 0:
             empty = np.zeros((0, 3), dtype=np.float32)
@@ -262,7 +468,6 @@ class XmoDatasetProcessor:
 
         distance = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=-1)
         distance = distance + np.eye(num_atoms, dtype=np.float32) * 1e6
-        nearest = np.argsort(distance, axis=-1)
 
         e1_parts = []
         e2_parts = []
@@ -278,25 +483,39 @@ class XmoDatasetProcessor:
                 e3_parts.append(default_e3)
                 continue
 
-            first_neighbor = int(nearest[atom_id, 0])
-            e1 = self.normalizeVector((positions[first_neighbor] - positions[atom_id]).astype(np.float32))
+            ranked_neighbors = self.orderedFrameNeighborCandidates(
+                atom_id=atom_id,
+                distance=distance,
+                atom_numbers=atom_numbers,
+                active_atom_mask=active_atom_mask,
+                bonded_adjacency=bonded_adjacency,
+            )
+            if len(ranked_neighbors) == 0:
+                e1_parts.append(default_e1)
+                e2_parts.append(default_e2)
+                e3_parts.append(default_e3)
+                continue
 
+            first_neighbor = int(ranked_neighbors[0])
+            sigma_axis = self.normalizeVector((positions[first_neighbor] - positions[atom_id]).astype(np.float32))
+
+            inplane_seed = None
             if num_atoms >= 3:
-                second_neighbor = int(nearest[atom_id, 1])
-                second_vector = positions[second_neighbor] - positions[atom_id]
-                projected = second_vector - float(np.dot(second_vector, e1)) * e1
-                if float(np.linalg.norm(projected)) < 1e-8:
-                    e2 = self.orthogonalDirection(e1)
-                else:
-                    e2 = self.normalizeVector(projected.astype(np.float32))
-            else:
-                e2 = self.orthogonalDirection(e1)
+                for neighbor_id in ranked_neighbors[1:]:
+                    candidate = positions[int(neighbor_id)] - positions[atom_id]
+                    projected = candidate - float(np.dot(candidate, sigma_axis)) * sigma_axis
+                    if float(np.linalg.norm(projected)) >= 1e-8:
+                        inplane_seed = self.normalizeVector(projected.astype(np.float32))
+                        break
 
-            e3 = self.normalizeVector(np.cross(e1, e2).astype(np.float32))
-            e2 = self.normalizeVector(np.cross(e3, e1).astype(np.float32))
-            e1_parts.append(e1)
-            e2_parts.append(e2)
-            e3_parts.append(e3)
+            if inplane_seed is None:
+                inplane_seed = self.orthogonalDirection(sigma_axis)
+
+            plane_normal = self.normalizeVector(np.cross(sigma_axis, inplane_seed).astype(np.float32))
+            inplane_perp = self.normalizeVector(np.cross(plane_normal, sigma_axis).astype(np.float32))
+            e1_parts.append(sigma_axis)
+            e2_parts.append(inplane_perp)
+            e3_parts.append(plane_normal)
 
         return (
             np.stack(e1_parts, axis=0),
@@ -335,7 +554,25 @@ class XmoDatasetProcessor:
     ) -> ProcessedMolecule:
         """Convert built graph fields into the cached processed-molecule object."""
 
-        local_frame_e1, local_frame_e2, local_frame_e3 = self.buildLocalFramesForPositions(built.atom_positions)
+        active_atom_mask = (
+            self.buildActiveAtomMask(
+                num_atoms=int(built.atom_numbers.shape[0]),
+                orbital_atom_index=built.structures[0].orbital_atom_index,
+                orbital_role=built.structures[0].orbital_role,
+            )
+            if len(built.structures) > 0
+            else np.zeros((int(built.atom_numbers.shape[0]),), dtype=bool)
+        )
+        bonded_adjacency = self.buildStaticBondAdjacency(
+            num_atoms=int(built.atom_numbers.shape[0]),
+            structures=built.structures,
+        )
+        local_frame_e1, local_frame_e2, local_frame_e3 = self.buildLocalFramesForPositions(
+            positions=built.atom_positions,
+            atom_numbers=built.atom_numbers,
+            active_atom_mask=active_atom_mask,
+            bonded_adjacency=bonded_adjacency,
+        )
         return ProcessedMolecule(
             dataset_id=dataset_id,
             molecule_id=self.cacheMoleculeId(dataset_id=dataset_id, molecule_id=built.molecule_id),
@@ -591,6 +828,9 @@ class XmoDatasetProcessor:
         adapter = GraphPackingAdapter()
         dataset_ids = list(getattr(processed_cache, "dataset_ids", None) or ["default"])
         split_ids_by_dataset = getattr(processed_cache, "split_ids_by_dataset", None)
+        if isHdf5Path(self.config.packed_cache_path):
+            clearPackedChunkStore(self.config.packed_cache_path)
+        view_names = ("full", "focus_only")
         if self.packedChunkDirectory() is None:
             split_chunks = self.createSplitMoleculeChunks()
             packed_chunks = {
@@ -614,41 +854,100 @@ class XmoDatasetProcessor:
             return PackedDatasetCache(
                 split_ids=processed_cache.split_ids,
                 split_structure_counts=split_structure_counts,
+                packed_chunks_by_view={
+                    "full": packed_chunks,
+                    "focus_only": {
+                        split_name: [
+                            adapter.packChunk(chunk)
+                            for molecule in self.createSplitProcessedMolecules()[split_name]
+                            for chunk in self.chunkProcessedMolecule(
+                                self.buildPackedViewMolecule(molecule, view_name="focus_only")
+                            )
+                            if len(chunk.structures) > 0
+                        ]
+                        for split_name in ["train", "val", "test"]
+                    },
+                },
+                split_structure_counts_by_view={
+                    "full": split_structure_counts,
+                    "focus_only": {
+                        split_name: int(
+                            sum(
+                                int(chunk.atom_n_node.shape[0])
+                                for chunk in [
+                                    adapter.packChunk(view_chunk)
+                                    for molecule in self.createSplitProcessedMolecules()[split_name]
+                                    for view_chunk in self.chunkProcessedMolecule(
+                                        self.buildPackedViewMolecule(molecule, view_name="focus_only")
+                                    )
+                                    if len(view_chunk.structures) > 0
+                                ]
+                            )
+                        )
+                        for split_name in ["train", "val", "test"]
+                    },
+                },
                 packed_chunks=packed_chunks,
                 packed_chunk_refs=None,
                 dataset_ids=dataset_ids,
                 split_ids_by_dataset=split_ids_by_dataset,
                 split_structure_counts_by_dataset=split_structure_counts_by_dataset,
             )
-        packed_chunk_refs: Dict[str, List[PackedChunkReference]] = {"train": [], "val": [], "test": []}
-        split_structure_counts = {"train": 0, "val": 0, "test": 0}
-        split_structure_counts_by_dataset: Dict[str, Dict[str, int]] = {
-            split_name: {dataset_id: 0 for dataset_id in dataset_ids}
-            for split_name in ["train", "val", "test"]
-        }
         split_molecules = self.createSplitProcessedMolecules()
+        packed_chunk_refs_by_view: Dict[str, Dict[str, List[PackedChunkReference]]] = {
+            view_name: {"train": [], "val": [], "test": []}
+            for view_name in view_names
+        }
+        split_structure_counts_by_view: Dict[str, Dict[str, int]] = {
+            view_name: {"train": 0, "val": 0, "test": 0}
+            for view_name in view_names
+        }
+        split_structure_counts_by_dataset_by_view: Dict[str, Dict[str, Dict[str, int]]] = {
+            view_name: {
+                split_name: {dataset_id: 0 for dataset_id in dataset_ids}
+                for split_name in ["train", "val", "test"]
+            }
+            for view_name in view_names
+        }
 
-        for split_name in ["train", "val", "test"]:
-            for molecule in split_molecules[split_name]:
-                for chunk in self.chunkProcessedMolecule(molecule):
-                    packed_chunk = adapter.packChunk(chunk)
-                    packed_chunk_refs[split_name].append(
-                        self.savePackedChunk(split_name=split_name, chunk=packed_chunk)
-                    )
-                    split_structure_counts[split_name] += int(packed_chunk.atom_n_node.shape[0])
-                    split_structure_counts_by_dataset[split_name].setdefault(packed_chunk.dataset_id, 0)
-                    split_structure_counts_by_dataset[split_name][packed_chunk.dataset_id] += int(
-                        packed_chunk.atom_n_node.shape[0]
-                    )
+        for view_name in view_names:
+            for split_name in ["train", "val", "test"]:
+                for molecule in split_molecules[split_name]:
+                    view_molecule = self.buildPackedViewMolecule(molecule, view_name=view_name)
+                    for chunk in self.chunkProcessedMolecule(view_molecule):
+                        if len(chunk.structures) == 0:
+                            continue
+                        packed_chunk = adapter.packChunk(chunk)
+                        packed_chunk_refs_by_view[view_name][split_name].append(
+                            self.savePackedChunk(
+                                split_name=split_name,
+                                chunk=packed_chunk,
+                                view_name=view_name,
+                            )
+                        )
+                        split_structure_counts_by_view[view_name][split_name] += int(
+                            packed_chunk.atom_n_node.shape[0]
+                        )
+                        split_structure_counts_by_dataset_by_view[view_name][split_name].setdefault(
+                            packed_chunk.dataset_id,
+                            0,
+                        )
+                        split_structure_counts_by_dataset_by_view[view_name][split_name][
+                            packed_chunk.dataset_id
+                        ] += int(packed_chunk.atom_n_node.shape[0])
 
         return PackedDatasetCache(
             split_ids=processed_cache.split_ids,
-            split_structure_counts=split_structure_counts,
+            split_structure_counts=split_structure_counts_by_view["full"],
+            packed_chunks_by_view=None,
+            packed_chunk_refs_by_view=packed_chunk_refs_by_view,
+            split_structure_counts_by_view=split_structure_counts_by_view,
+            split_structure_counts_by_dataset_by_view=split_structure_counts_by_dataset_by_view,
             packed_chunks=None,
-            packed_chunk_refs=packed_chunk_refs,
+            packed_chunk_refs=packed_chunk_refs_by_view["full"],
             dataset_ids=dataset_ids,
             split_ids_by_dataset=split_ids_by_dataset,
-            split_structure_counts_by_dataset=split_structure_counts_by_dataset,
+            split_structure_counts_by_dataset=split_structure_counts_by_dataset_by_view["full"],
         )
 
     def createPackedDatasetCache(self, force_rebuild: bool = False) -> PackedDatasetCache:

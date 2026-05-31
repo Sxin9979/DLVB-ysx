@@ -11,6 +11,7 @@ import jraph
 import numpy as np
 from grain import python as grain
 
+from data.hdf5_io import readPackedChunk
 from data.lap_pe import lapPeFromEdges, repeatLapEvalsPerNode
 from data.schema import (
     FixedBucketSpec,
@@ -20,7 +21,11 @@ from data.schema import (
     UnifiedBatch,
     UnifiedSample,
 )
-from utils.top_mass import computeTopMassFocusMask, selectTopMassStructureIndices
+from utils.top_mass import (
+    capTopMassTailSamplesByBudget,
+    computeTopMassFocusMask,
+    selectTopMassStructureIndices,
+)
 
 
 class GraphPackingAdapter:
@@ -313,6 +318,11 @@ class GraphPackingAdapter:
         Load one packed chunk payload from disk on demand.
         """
 
+        if getattr(chunk_ref, "storage_format", "pickle") == "hdf5":
+            dataset_path = getattr(chunk_ref, "hdf5_dataset_path", None)
+            if dataset_path is None:
+                raise ValueError("HDF5 packed chunk reference is missing hdf5_dataset_path.")
+            return readPackedChunk(chunk_ref.chunk_path, dataset_path=dataset_path)
         with open(chunk_ref.chunk_path, "rb") as handle:
             payload = pickle.load(handle)
         if not isinstance(payload, PackedMoleculeChunk):
@@ -715,15 +725,34 @@ class GraphPackingAdapter:
             from model.orbital_projection import LocalOrbitalProjector
 
             projector = LocalOrbitalProjector()
-            positions = jnp.concatenate(
-                [jnp.asarray(sample.atom_positions, dtype=jnp.float32) for sample in samples],
-                axis=0,
-            )
-            atom_counts = jnp.asarray([sample.atom_numbers.shape[0] for sample in samples], dtype=jnp.int32)
-            computed_e1, computed_e2, computed_e3 = projector.buildLocalFrames(positions, atom_counts)
-            local_frame_e1 = np.asarray(computed_e1, dtype=np.float32)
-            local_frame_e2 = np.asarray(computed_e2, dtype=np.float32)
-            local_frame_e3 = np.asarray(computed_e3, dtype=np.float32)
+            e1_parts = []
+            e2_parts = []
+            e3_parts = []
+            for sample in samples:
+                num_atoms = int(sample.atom_numbers.shape[0])
+                active_atom_mask = np.zeros((num_atoms,), dtype=bool)
+                active_owner = np.asarray(sample.orbital_atom_index, dtype=np.int32)[
+                    np.asarray(sample.orbital_role, dtype=np.int32) == 2,
+                    0,
+                ]
+                active_atom_mask[np.asarray(active_owner, dtype=np.int32)] = True
+                bonded_adjacency = np.zeros((num_atoms, num_atoms), dtype=bool)
+                senders = np.asarray(sample.atom_senders, dtype=np.int32)
+                receivers = np.asarray(sample.atom_receivers, dtype=np.int32)
+                bonded_adjacency[senders, receivers] = True
+                bonded_adjacency[receivers, senders] = True
+                computed_e1, computed_e2, computed_e3 = projector.buildFrameForOneGraph(
+                    positions=jnp.asarray(sample.atom_positions, dtype=jnp.float32),
+                    atom_numbers=jnp.asarray(sample.atom_numbers, dtype=jnp.int32),
+                    active_atom_mask=jnp.asarray(active_atom_mask),
+                    bonded_adjacency=jnp.asarray(bonded_adjacency),
+                )
+                e1_parts.append(np.asarray(computed_e1, dtype=np.float32))
+                e2_parts.append(np.asarray(computed_e2, dtype=np.float32))
+                e3_parts.append(np.asarray(computed_e3, dtype=np.float32))
+            local_frame_e1 = np.concatenate(e1_parts, axis=0)
+            local_frame_e2 = np.concatenate(e2_parts, axis=0)
+            local_frame_e3 = np.concatenate(e3_parts, axis=0)
 
         metadata = self.buildOrbitalMetadata(samples)
         lap_metadata = self.buildLapPeMetadata(samples)
@@ -1380,6 +1409,341 @@ class GrainPipeline:
             return "default"
         return self.adapter.chunkDatasetId(chunk_group[0])
 
+    def chunkNumStructures(
+        self,
+        chunk: PackedMoleculeChunk | PackedChunkReference,
+    ) -> int:
+        """
+        Return the number of structures stored in one chunk record.
+        """
+
+        if isinstance(chunk, PackedChunkReference):
+            return int(chunk.num_structures)
+        return int(chunk.atom_n_node.shape[0])
+
+    def chunkNumFocusStructures(
+        self,
+        chunk: PackedMoleculeChunk | PackedChunkReference,
+    ) -> int:
+        """
+        Return the number of top-mass focus structures stored in one chunk record.
+        """
+
+        if isinstance(chunk, PackedChunkReference):
+            return int(getattr(chunk, "num_focus_structures", 0))
+        focus_mask = np.asarray(
+            getattr(
+                chunk,
+                "top_mass_focus_mask",
+                np.zeros((int(chunk.atom_n_node.shape[0]),), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        return int(np.sum(focus_mask > 0.5))
+
+    def chunkActiveOrbitalCount(
+        self,
+        chunk: ProcessedMoleculeChunk | PackedMoleculeChunk | PackedChunkReference,
+    ) -> int:
+        """
+        Estimate the active-orbital count for one molecule chunk.
+        """
+
+        if isinstance(chunk, PackedChunkReference):
+            num_structures = max(int(chunk.num_structures), 1)
+            return int(round(float(chunk.total_active_orbitals) / float(num_structures)))
+        if isinstance(chunk, PackedMoleculeChunk):
+            active_counts = np.asarray(chunk.active_rumer_n_node, dtype=np.int32)
+            if active_counts.size == 0:
+                return 0
+            return int(active_counts[0])
+        if len(chunk.structures) == 0:
+            return 0
+        return int(np.asarray(chunk.structures[0].active_orbital_index, dtype=np.int32).shape[0])
+
+    def chunkActiveElectronCount(
+        self,
+        chunk: ProcessedMoleculeChunk | PackedMoleculeChunk | PackedChunkReference,
+    ) -> int:
+        """
+        Estimate the active-electron count from atom feature channel 1.
+
+        Older lightweight chunk references do not store this value; those safely
+        use -1 so they still group by active-orbital count without eager loading.
+        """
+
+        if isinstance(chunk, PackedChunkReference):
+            return int(getattr(chunk, "num_active_electrons", -1))
+        if isinstance(chunk, PackedMoleculeChunk):
+            atom_counts = np.asarray(chunk.atom_n_node, dtype=np.int32)
+            if atom_counts.size == 0:
+                return -1
+            first_atom_count = int(atom_counts[0])
+            atom_features = np.asarray(chunk.atom_node_features, dtype=np.float32)
+            if atom_features.ndim != 2 or atom_features.shape[1] < 2:
+                return -1
+            return int(round(float(np.sum(atom_features[:first_atom_count, 1]))))
+        if len(chunk.structures) == 0:
+            return -1
+        atom_features = np.asarray(chunk.structures[0].atom_node_features, dtype=np.float32)
+        if atom_features.ndim != 2 or atom_features.shape[1] < 2:
+            return -1
+        return int(round(float(np.sum(atom_features[:, 1]))))
+
+    def chunkActiveSpaceKey(
+        self,
+        chunk: ProcessedMoleculeChunk | PackedMoleculeChunk | PackedChunkReference,
+    ) -> Tuple[int, int]:
+        """
+        Return the active-space size key ``(num_active_electrons, num_active_orbitals)``.
+        """
+
+        return (
+            self.chunkActiveElectronCount(chunk),
+            self.chunkActiveOrbitalCount(chunk),
+        )
+
+    def groupActiveSpaceKey(
+        self,
+        chunk_group: Sequence[PackedMoleculeChunk | PackedChunkReference],
+    ) -> Tuple[int, int]:
+        """
+        Return the active-space key for one whole-molecule chunk group.
+        """
+
+        if len(chunk_group) == 0:
+            return (-1, 0)
+        return self.chunkActiveSpaceKey(chunk_group[0])
+
+    def estimateChunkCost(
+        self,
+        chunk: PackedMoleculeChunk | PackedChunkReference,
+        selected_num_structures: int | None = None,
+    ) -> int:
+        """
+        Estimate one chunk cost in heuristic units aligned with packed graph size.
+
+        The estimator tracks the dominant tensor axes that fixed-bucket padding
+        must allocate: expanded atom nodes/edges, orbital nodes/edges, active
+        orbital nodes/edges, plus one static-atom term that is paid once per
+        selected chunk.
+        """
+
+        if isinstance(chunk, PackedChunkReference):
+            num_structures = int(chunk.num_structures)
+            static_num_atoms = int(getattr(chunk, "static_num_atoms", 0))
+            total_atoms = int(chunk.total_atoms)
+            total_atom_edges = int(getattr(chunk, "total_atom_edges", 0))
+            total_orbitals = int(chunk.total_orbitals)
+            total_rumer_edges = int(getattr(chunk, "total_rumer_edges", 0))
+            total_active_orbitals = int(getattr(chunk, "total_active_orbitals", 0))
+            total_active_rumer_edges = int(getattr(chunk, "total_active_rumer_edges", 0))
+        else:
+            num_structures = int(chunk.atom_n_node.shape[0])
+            static_num_atoms = int(np.asarray(chunk.atom_numbers, dtype=np.int32).shape[0])
+            total_atoms = int(np.asarray(chunk.atom_n_node, dtype=np.int32).sum())
+            total_atom_edges = int(np.asarray(chunk.atom_n_edge, dtype=np.int32).sum())
+            total_orbitals = int(np.asarray(chunk.rumer_n_node, dtype=np.int32).sum())
+            total_rumer_edges = int(np.asarray(chunk.rumer_n_edge, dtype=np.int32).sum())
+            total_active_orbitals = int(np.asarray(chunk.active_rumer_n_node, dtype=np.int32).sum())
+            total_active_rumer_edges = int(np.asarray(chunk.active_rumer_n_edge, dtype=np.int32).sum())
+
+        if num_structures <= 0:
+            return 0
+
+        selected = num_structures if selected_num_structures is None else int(selected_num_structures)
+        selected = min(max(selected, 0), num_structures)
+        if selected <= 0:
+            return 0
+        dynamic_ratio = float(selected) / float(num_structures)
+        dynamic_cost = int(
+            np.ceil(
+                dynamic_ratio
+                * (
+                    total_atoms
+                    + total_atom_edges
+                    + total_orbitals
+                    + total_rumer_edges
+                    + total_active_orbitals
+                    + total_active_rumer_edges
+                )
+            )
+        )
+        return int(static_num_atoms + dynamic_cost)
+
+    def estimateMoleculeGroupCost(
+        self,
+        chunk_group: Sequence[PackedMoleculeChunk | PackedChunkReference],
+        selected_num_structures: int | None = None,
+    ) -> int:
+        """
+        Estimate one whole-molecule runtime cost from chunk metadata.
+        """
+
+        total_structures = int(sum(self.chunkNumStructures(chunk) for chunk in chunk_group))
+        if total_structures <= 0:
+            return 0
+        selected_total = total_structures if selected_num_structures is None else int(selected_num_structures)
+        selected_total = min(max(selected_total, 0), total_structures)
+        if selected_total <= 0:
+            return 0
+
+        remaining = selected_total
+        total_cost = 0
+        for chunk in chunk_group:
+            chunk_structures = self.chunkNumStructures(chunk)
+            chunk_selected = min(remaining, chunk_structures)
+            total_cost += self.estimateChunkCost(chunk, selected_num_structures=chunk_selected)
+            remaining -= chunk_selected
+            if remaining <= 0:
+                break
+        return int(total_cost)
+
+    def estimateMoleculeGroupSelectedStructures(
+        self,
+        chunk_group: Sequence[PackedMoleculeChunk | PackedChunkReference],
+        top_mass_sample_strategy: str,
+        max_tail_samples_per_molecule: int | None,
+        max_structure_cost_per_molecule: int | None,
+    ) -> int:
+        """
+        Estimate how many structures one molecule will contribute after runtime
+        top-mass sampling and per-molecule cost capping.
+        """
+
+        total_structures = int(sum(self.chunkNumStructures(chunk) for chunk in chunk_group))
+        if top_mass_sample_strategy == "full_molecule":
+            return total_structures
+
+        total_focus_structures = int(
+            sum(self.chunkNumFocusStructures(chunk) for chunk in chunk_group)
+        )
+        average_structure_cost = max(
+            float(self.estimateMoleculeGroupCost(chunk_group)),
+            1.0,
+        ) / max(total_structures, 1)
+        effective_tail_cap = capTopMassTailSamplesByBudget(
+            num_structures=total_structures,
+            num_focus_structures=total_focus_structures,
+            structure_cost=average_structure_cost,
+            max_tail_samples=max_tail_samples_per_molecule,
+            max_structure_cost=max_structure_cost_per_molecule,
+        )
+        if effective_tail_cap is None:
+            effective_tail_cap = max(total_structures - total_focus_structures, 0)
+        return int(
+            min(
+                total_structures,
+                total_focus_structures + max(int(effective_tail_cap), 0),
+            )
+        )
+
+    def buildOrderedGroupIndices(
+        self,
+        chunk_groups: Sequence[Sequence[PackedMoleculeChunk | PackedChunkReference]],
+        batch_size: int,
+        shuffle: bool,
+        seed: int,
+        bucket_key: str | None,
+        drop_remainder: bool,
+        dataset_sampling_strategy: str,
+    ) -> List[int]:
+        """
+        Build one stable molecule order before optional budget-based repacking.
+        """
+
+        if len(chunk_groups) == 0:
+            return []
+
+        if dataset_sampling_strategy == "balanced":
+            grouped_batches = self.buildDatasetBalancedGroupedBatchIndices(
+                chunk_groups=chunk_groups,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                seed=seed,
+                bucket_key=bucket_key,
+                drop_remainder=drop_remainder,
+            )
+            return [index for batch in grouped_batches for index in batch]
+
+        if bucket_key is not None:
+            grouped_batches = self.buildGroupedBatchIndices(
+                chunk_groups=chunk_groups,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                seed=seed,
+                bucket_key=bucket_key,
+                drop_remainder=drop_remainder,
+            )
+            return [index for batch in grouped_batches for index in batch]
+
+        ordered_indices = list(range(len(chunk_groups)))
+        if shuffle:
+            rng = np.random.default_rng(seed)
+            rng.shuffle(ordered_indices)
+        if drop_remainder:
+            usable = (len(ordered_indices) // batch_size) * batch_size
+            ordered_indices = ordered_indices[:usable]
+        return ordered_indices
+
+    def buildBudgetedGroupedBatchIndices(
+        self,
+        chunk_groups: Sequence[Sequence[PackedMoleculeChunk | PackedChunkReference]],
+        batch_size: int,
+        shuffle: bool,
+        seed: int,
+        bucket_key: str | None,
+        drop_remainder: bool,
+        dataset_sampling_strategy: str,
+        max_batch_cost: int,
+        top_mass_sample_strategy: str,
+        max_tail_samples_per_molecule: int | None,
+        max_structure_cost_per_molecule: int | None,
+    ) -> List[List[int]]:
+        """
+        Build approximate whole-molecule batches under one explicit cost budget.
+        """
+
+        ordered_indices = self.buildOrderedGroupIndices(
+            chunk_groups=chunk_groups,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            seed=seed,
+            bucket_key=bucket_key,
+            drop_remainder=False,
+            dataset_sampling_strategy=dataset_sampling_strategy,
+        )
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_cost = 0
+        for index in ordered_indices:
+            estimated_structures = self.estimateMoleculeGroupSelectedStructures(
+                chunk_group=chunk_groups[index],
+                top_mass_sample_strategy=top_mass_sample_strategy,
+                max_tail_samples_per_molecule=max_tail_samples_per_molecule,
+                max_structure_cost_per_molecule=max_structure_cost_per_molecule,
+            )
+            estimated_cost = self.estimateMoleculeGroupCost(
+                chunk_group=chunk_groups[index],
+                selected_num_structures=estimated_structures,
+            )
+            should_flush = (
+                len(current_batch) > 0
+                and (
+                    len(current_batch) >= batch_size
+                    or (current_cost + estimated_cost) > int(max_batch_cost)
+                )
+            )
+            if should_flush:
+                batches.append(current_batch)
+                current_batch = []
+                current_cost = 0
+            current_batch.append(index)
+            current_cost += estimated_cost
+        if len(current_batch) > 0 and ((not drop_remainder) or (len(current_batch) >= batch_size)):
+            batches.append(current_batch)
+        return batches
+
     def buildDatasetBalancedGroupedBatchIndices(
         self,
         chunk_groups: Sequence[Sequence[PackedMoleculeChunk | PackedChunkReference]],
@@ -1478,6 +1842,15 @@ class GrainPipeline:
             return (total_atoms, num_structures)
         if bucket_key in {"num_atoms_num_orbitals", "(num_atoms,num_orbitals)"}:
             return (total_atoms, total_orbitals, num_structures)
+        if bucket_key == "active_space":
+            num_active_electrons, num_active_orbitals = self.chunkActiveSpaceKey(chunk)
+            return (
+                num_active_electrons,
+                num_active_orbitals,
+                total_atoms,
+                total_orbitals,
+                num_structures,
+            )
         raise ValueError(f"Unsupported bucket_key={bucket_key}.")
 
     def chunkCoarseBucketId(
@@ -1499,6 +1872,21 @@ class GrainPipeline:
         if bucket_key in {"num_atoms_num_orbitals", "(num_atoms,num_orbitals)"}:
             total_atoms, total_orbitals, num_structures = raw_key
             return (
+                int(np.ceil(total_atoms / 64.0)),
+                int(np.ceil(total_orbitals / 32.0)),
+                int(np.ceil(num_structures / 4.0)),
+            )
+        if bucket_key == "active_space":
+            (
+                num_active_electrons,
+                num_active_orbitals,
+                total_atoms,
+                total_orbitals,
+                num_structures,
+            ) = raw_key
+            return (
+                num_active_electrons,
+                num_active_orbitals,
                 int(np.ceil(total_atoms / 64.0)),
                 int(np.ceil(total_orbitals / 32.0)),
                 int(np.ceil(num_structures / 4.0)),
@@ -1554,6 +1942,15 @@ class GrainPipeline:
             return (total_atoms, total_structures)
         if bucket_key in {"num_atoms_num_orbitals", "(num_atoms,num_orbitals)"}:
             return (total_atoms, total_orbitals, total_structures)
+        if bucket_key == "active_space":
+            num_active_electrons, num_active_orbitals = self.groupActiveSpaceKey(chunk_group)
+            return (
+                num_active_electrons,
+                num_active_orbitals,
+                total_atoms,
+                total_orbitals,
+                total_structures,
+            )
         raise ValueError(f"Unsupported bucket_key={bucket_key}.")
 
     def groupCoarseBucketId(
@@ -1575,6 +1972,21 @@ class GrainPipeline:
         if bucket_key in {"num_atoms_num_orbitals", "(num_atoms,num_orbitals)"}:
             total_atoms, total_orbitals, total_structures = raw_key
             return (
+                int(np.ceil(total_atoms / 64.0)),
+                int(np.ceil(total_orbitals / 32.0)),
+                int(np.ceil(total_structures / 4.0)),
+            )
+        if bucket_key == "active_space":
+            (
+                num_active_electrons,
+                num_active_orbitals,
+                total_atoms,
+                total_orbitals,
+                total_structures,
+            ) = raw_key
+            return (
+                num_active_electrons,
+                num_active_orbitals,
                 int(np.ceil(total_atoms / 64.0)),
                 int(np.ceil(total_orbitals / 32.0)),
                 int(np.ceil(total_structures / 4.0)),
@@ -1777,6 +2189,66 @@ class GrainPipeline:
                 loaded_chunks.append(chunk_record)
         return loaded_chunks
 
+    def emitPackedMoleculeBatch(
+        self,
+        chunk_batch: Sequence[PackedMoleculeChunk],
+        batch_size: int,
+        fixed_bucket_config: dict[str, int] | None,
+        batch_id: int,
+        split_name: str,
+        num_structures_per_molecule: Sequence[int],
+        dataset_index_per_molecule: Sequence[int],
+        num_molecules_in_batch: int,
+    ) -> UnifiedBatch:
+        """
+        Pack one ready-to-emit whole-molecule batch and log its realized size.
+        """
+
+        total_structures = int(sum(int(chunk.atom_n_node.shape[0]) for chunk in chunk_batch))
+        self.logIteratorStage(
+            split_name=split_name,
+            batch_id=batch_id,
+            stage="chunks_loaded",
+            extra=f"num_chunks={len(chunk_batch)} total_structures={total_structures}",
+        )
+
+        fixed_bucket_spec = None
+        if fixed_bucket_config is not None:
+            fixed_bucket_spec = self.adapter.buildFixedBucketSpec(
+                chunks=chunk_batch,
+                graph_step=int(fixed_bucket_config["graph_step"]),
+                static_atom_step=int(fixed_bucket_config["static_atom_step"]),
+                atom_step=int(fixed_bucket_config["atom_step"]),
+                atom_edge_step=int(fixed_bucket_config["atom_edge_step"]),
+                orbital_step=int(fixed_bucket_config["orbital_step"]),
+                rumer_edge_step=int(fixed_bucket_config["rumer_edge_step"]),
+                active_orbital_step=int(fixed_bucket_config["active_orbital_step"]),
+                active_edge_step=int(fixed_bucket_config["active_edge_step"]),
+            )
+
+        packed_batch = self.adapter.packPackedChunkBatch(
+            list(chunk_batch),
+            orbital_feature_dim=self.orbital_feature_dim,
+            fixed_bucket_spec=fixed_bucket_spec,
+            molecule_batch_size_target=batch_size if fixed_bucket_spec is not None else None,
+            num_structures_per_molecule=list(num_structures_per_molecule),
+            num_molecules_in_batch=int(num_molecules_in_batch),
+            dataset_index_per_molecule=list(dataset_index_per_molecule),
+        )
+        self.logIteratorStage(
+            split_name=split_name,
+            batch_id=batch_id,
+            stage="batch_packed",
+            extra=(
+                f"num_graphs={int(packed_batch.num_atoms_per_graph.shape[0])} "
+                f"total_atoms={int(packed_batch.num_atoms_per_graph.sum())} "
+                f"total_orbitals={int(packed_batch.num_orbitals_per_graph.sum())} "
+                f"total_active_orbitals={int(packed_batch.active_rumer_graph.n_node.sum())} "
+                f"real_graphs={int(np.asarray(packed_batch.sample_mask, dtype=np.float32).sum())}"
+            ),
+        )
+        return packed_batch
+
     def annotateChunkGroupWithTopMassFocus(
         self,
         chunk_group: Sequence[PackedMoleculeChunk],
@@ -1838,6 +2310,65 @@ class GrainPipeline:
             offset += count
         return selected_chunks
 
+    def materializeSampledMoleculeGroup(
+        self,
+        chunk_group: Sequence[PackedMoleculeChunk | PackedChunkReference],
+        focus_cumulative_mass: float,
+        top_mass_sample_strategy: str,
+        max_tail_samples_per_molecule: int | None,
+        mixed_tail_top_fraction: float,
+        max_structure_cost_per_molecule: int | None,
+        rng: np.random.Generator,
+    ) -> tuple[list[PackedMoleculeChunk], int, int]:
+        """
+        Load one molecule, attach focus masks, and apply budget-aware top-mass
+        structure sampling.
+        """
+
+        loaded_group = self.loadChunkGroup(chunk_group)
+        focused_group, full_focus_mask = self.annotateChunkGroupWithTopMassFocus(
+            chunk_group=loaded_group,
+            focus_cumulative_mass=focus_cumulative_mass,
+        )
+        full_target = np.concatenate(
+            [np.asarray(chunk.targets, dtype=np.float32) for chunk in focused_group],
+            axis=0,
+        )
+        total_structures = int(full_target.shape[0])
+        if top_mass_sample_strategy == "full_molecule":
+            selected_group = focused_group
+            selected_count = total_structures
+        else:
+            average_structure_cost = max(
+                float(self.estimateMoleculeGroupCost(focused_group)),
+                1.0,
+            ) / max(total_structures, 1)
+            effective_tail_cap = capTopMassTailSamplesByBudget(
+                num_structures=total_structures,
+                num_focus_structures=int(np.sum(full_focus_mask > 0.5)),
+                structure_cost=average_structure_cost,
+                max_tail_samples=max_tail_samples_per_molecule,
+                max_structure_cost=max_structure_cost_per_molecule,
+            )
+            selected_index = selectTopMassStructureIndices(
+                target=full_target,
+                focus_mask=full_focus_mask,
+                strategy=top_mass_sample_strategy,
+                max_tail_samples=effective_tail_cap,
+                rng=rng,
+                mixed_top_fraction=mixed_tail_top_fraction,
+            )
+            selected_group = self.selectChunkGroupStructures(
+                chunk_group=focused_group,
+                selected_structure_index=selected_index,
+            )
+            selected_count = int(selected_index.shape[0])
+        selected_cost = self.estimateMoleculeGroupCost(
+            selected_group,
+            selected_num_structures=selected_count,
+        )
+        return selected_group, selected_count, selected_cost
+
     def createMoleculeIterator(
         self,
         molecule_groups: List[List[PackedMoleculeChunk | PackedChunkReference]],
@@ -1853,12 +2384,112 @@ class GrainPipeline:
         max_tail_samples_per_molecule: int | None = None,
         mixed_tail_top_fraction: float = 0.5,
         dataset_sampling_strategy: str = "natural",
+        max_batch_cost: int | None = None,
+        max_structure_cost_per_molecule: int | None = None,
     ) -> Iterator[UnifiedBatch]:
         """
         Create one iterator that batches whole molecules, optionally with top-mass subsampling.
         """
 
         ordered_groups = molecule_groups
+        rng = np.random.default_rng(seed)
+        if (max_batch_cost is not None) and (int(max_batch_cost) > 0):
+            ordered_indices = self.buildOrderedGroupIndices(
+                chunk_groups=molecule_groups,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                seed=seed,
+                bucket_key=bucket_key,
+                drop_remainder=False,
+                dataset_sampling_strategy=dataset_sampling_strategy,
+            )
+            current_chunk_batch: list[PackedMoleculeChunk] = []
+            current_num_structures: list[int] = []
+            current_dataset_indices: list[int] = []
+            current_batch_molecule_indices: list[int] = []
+            current_cost = 0
+            batch_id = 0
+
+            for molecule_index in ordered_indices:
+                selected_group, selected_count, selected_cost = self.materializeSampledMoleculeGroup(
+                    chunk_group=ordered_groups[molecule_index],
+                    focus_cumulative_mass=focus_cumulative_mass,
+                    top_mass_sample_strategy=top_mass_sample_strategy,
+                    max_tail_samples_per_molecule=max_tail_samples_per_molecule,
+                    mixed_tail_top_fraction=mixed_tail_top_fraction,
+                    max_structure_cost_per_molecule=max_structure_cost_per_molecule,
+                    rng=rng,
+                )
+                should_flush = (
+                    len(current_batch_molecule_indices) > 0
+                    and (
+                        len(current_batch_molecule_indices) >= batch_size
+                        or (current_cost + selected_cost) > int(max_batch_cost)
+                    )
+                )
+                if should_flush:
+                    self.logIteratorStage(
+                        split_name=split_name,
+                        batch_id=batch_id,
+                        stage="indices_ready",
+                        extra=(
+                            f"num_molecules={len(current_batch_molecule_indices)} "
+                            f"budget_cost={current_cost}"
+                        ),
+                    )
+                    yield self.emitPackedMoleculeBatch(
+                        chunk_batch=current_chunk_batch,
+                        batch_size=batch_size,
+                        fixed_bucket_config=fixed_bucket_config,
+                        batch_id=batch_id,
+                        split_name=split_name,
+                        num_structures_per_molecule=current_num_structures,
+                        dataset_index_per_molecule=current_dataset_indices,
+                        num_molecules_in_batch=len(current_batch_molecule_indices),
+                    )
+                    batch_id += 1
+                    current_chunk_batch = []
+                    current_num_structures = []
+                    current_dataset_indices = []
+                    current_batch_molecule_indices = []
+                    current_cost = 0
+
+                current_chunk_batch.extend(selected_group)
+                current_num_structures.append(selected_count)
+                current_dataset_indices.append(
+                    int(
+                        self.dataset_index_by_id.get(
+                            self.chunkGroupDatasetId(ordered_groups[molecule_index]),
+                            0,
+                        )
+                    )
+                )
+                current_batch_molecule_indices.append(molecule_index)
+                current_cost += selected_cost
+
+            if len(current_batch_molecule_indices) > 0:
+                if (not drop_remainder) or (len(current_batch_molecule_indices) >= batch_size):
+                    self.logIteratorStage(
+                        split_name=split_name,
+                        batch_id=batch_id,
+                        stage="indices_ready",
+                        extra=(
+                            f"num_molecules={len(current_batch_molecule_indices)} "
+                            f"budget_cost={current_cost}"
+                        ),
+                    )
+                    yield self.emitPackedMoleculeBatch(
+                        chunk_batch=current_chunk_batch,
+                        batch_size=batch_size,
+                        fixed_bucket_config=fixed_bucket_config,
+                        batch_id=batch_id,
+                        split_name=split_name,
+                        num_structures_per_molecule=current_num_structures,
+                        dataset_index_per_molecule=current_dataset_indices,
+                        num_molecules_in_batch=len(current_batch_molecule_indices),
+                    )
+            return
+
         bucketed_batch_indices: list[list[int]] | None = None
         if bucket_key is not None:
             bucketed_batch_indices = self.buildGroupedBatchIndices(
@@ -1892,7 +2523,6 @@ class GrainPipeline:
         else:
             batch_index_iterable = bucketed_batch_indices
 
-        rng = np.random.default_rng(seed)
         for batch_id, batch_indices in enumerate(batch_index_iterable):
             self.logIteratorStage(
                 split_name=split_name,
@@ -1904,64 +2534,24 @@ class GrainPipeline:
             chunk_batch: list[PackedMoleculeChunk] = []
             num_structures_per_molecule: list[int] = []
             for molecule_index in batch_indices:
-                loaded_group = self.loadChunkGroup(ordered_groups[molecule_index])
-                focused_group, full_focus_mask = self.annotateChunkGroupWithTopMassFocus(
-                    chunk_group=loaded_group,
+                selected_group, selected_count, _ = self.materializeSampledMoleculeGroup(
+                    chunk_group=ordered_groups[molecule_index],
                     focus_cumulative_mass=focus_cumulative_mass,
+                    top_mass_sample_strategy=top_mass_sample_strategy,
+                    max_tail_samples_per_molecule=max_tail_samples_per_molecule,
+                    mixed_tail_top_fraction=mixed_tail_top_fraction,
+                    max_structure_cost_per_molecule=max_structure_cost_per_molecule,
+                    rng=rng,
                 )
-                full_target = np.concatenate(
-                    [np.asarray(chunk.targets, dtype=np.float32) for chunk in focused_group],
-                    axis=0,
-                )
-                if top_mass_sample_strategy == "full_molecule":
-                    selected_group = focused_group
-                    selected_count = int(full_target.shape[0])
-                else:
-                    selected_index = selectTopMassStructureIndices(
-                        target=full_target,
-                        focus_mask=full_focus_mask,
-                        strategy=top_mass_sample_strategy,
-                        max_tail_samples=max_tail_samples_per_molecule,
-                        rng=rng,
-                        mixed_top_fraction=mixed_tail_top_fraction,
-                    )
-                    selected_group = self.selectChunkGroupStructures(
-                        chunk_group=focused_group,
-                        selected_structure_index=selected_index,
-                    )
-                    selected_count = int(selected_index.shape[0])
                 chunk_batch.extend(selected_group)
                 num_structures_per_molecule.append(selected_count)
-
-            total_structures = int(sum(int(chunk.atom_n_node.shape[0]) for chunk in chunk_batch))
-            self.logIteratorStage(
-                split_name=split_name,
+            yield self.emitPackedMoleculeBatch(
+                chunk_batch=chunk_batch,
+                batch_size=batch_size,
+                fixed_bucket_config=fixed_bucket_config,
                 batch_id=batch_id,
-                stage="chunks_loaded",
-                extra=f"num_chunks={len(chunk_batch)} total_structures={total_structures}",
-            )
-
-            fixed_bucket_spec = None
-            if fixed_bucket_config is not None:
-                fixed_bucket_spec = self.adapter.buildFixedBucketSpec(
-                    chunks=chunk_batch,
-                    graph_step=int(fixed_bucket_config["graph_step"]),
-                    static_atom_step=int(fixed_bucket_config["static_atom_step"]),
-                    atom_step=int(fixed_bucket_config["atom_step"]),
-                    atom_edge_step=int(fixed_bucket_config["atom_edge_step"]),
-                    orbital_step=int(fixed_bucket_config["orbital_step"]),
-                    rumer_edge_step=int(fixed_bucket_config["rumer_edge_step"]),
-                    active_orbital_step=int(fixed_bucket_config["active_orbital_step"]),
-                    active_edge_step=int(fixed_bucket_config["active_edge_step"]),
-                )
-
-            packed_batch = self.adapter.packPackedChunkBatch(
-                chunk_batch,
-                orbital_feature_dim=self.orbital_feature_dim,
-                fixed_bucket_spec=fixed_bucket_spec,
-                molecule_batch_size_target=batch_size if fixed_bucket_spec is not None else None,
+                split_name=split_name,
                 num_structures_per_molecule=num_structures_per_molecule,
-                num_molecules_in_batch=len(batch_indices),
                 dataset_index_per_molecule=[
                     int(
                         self.dataset_index_by_id.get(
@@ -1971,20 +2561,8 @@ class GrainPipeline:
                     )
                     for molecule_index in batch_indices
                 ],
+                num_molecules_in_batch=len(batch_indices),
             )
-            self.logIteratorStage(
-                split_name=split_name,
-                batch_id=batch_id,
-                stage="batch_packed",
-                extra=(
-                    f"num_graphs={int(packed_batch.num_atoms_per_graph.shape[0])} "
-                    f"total_atoms={int(packed_batch.num_atoms_per_graph.sum())} "
-                    f"total_orbitals={int(packed_batch.num_orbitals_per_graph.sum())} "
-                    f"total_active_orbitals={int(packed_batch.active_rumer_graph.n_node.sum())} "
-                    f"real_graphs={int(np.asarray(packed_batch.sample_mask, dtype=np.float32).sum())}"
-                ),
-            )
-            yield packed_batch
 
     def createSplitIterators(
         self,

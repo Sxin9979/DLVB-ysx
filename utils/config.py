@@ -19,15 +19,19 @@ class TrainingConfig:
 
     Arguments:
     - seed: Global random seed.
-    - batch_size: Number of molecules per batch.
+    - batch_size: Number of molecules per training batch.
+    - eval_batch_size: Optional number of molecules per validation/test batch.
     - epochs: Number of epochs.
     - learning_rate: Initial AdamW learning rate.
     - min_learning_rate: Final cosine-decay learning rate floor.
     - weight_decay: AdamW weight decay.
+    - gradient_clip_norm: Optional global gradient clipping norm. Non-positive
+      values disable clipping.
     - early_stopping_patience: Number of post-warmup epochs allowed without val improvement.
     - early_stopping_start_epoch: First epoch index where early stopping becomes active.
     - bucketed_batching: Whether to bucket training molecule groups by size.
-    - bucket_key: Size key used for training molecule buckets.
+    - bucket_key: Size key used for training molecule buckets. ``active_space``
+      first groups by active-space size and then by packed graph size.
     - train_drop_remainder: Whether to drop the final short training batch.
     - fixed_bucket_batching: Whether to pad training batches to coarse fixed buckets.
     - fixed_bucket_graph_step: Graph-count bucket size.
@@ -63,20 +67,33 @@ class TrainingConfig:
     - mixed_tail_top_fraction: Fraction of sampled tail slots reserved for the
       hardest tail examples when using ``focus_plus_mixed_tail``.
     - max_tail_samples_per_molecule: Optional cap on sampled tail structures during top-mass training.
+    - max_focus_rank_samples_per_molecule: Optional top-target focus samples per molecule
+      used by sampled top-mass ranking. Zero keeps full pairwise ranking.
+    - max_tail_rank_samples_per_molecule: Optional top-target tail samples per molecule
+      used by sampled focus-vs-tail ranking.
+    - max_rank_pairs_per_molecule: Optional sampled ranking pairs per molecule.
+    - max_batch_cost: Optional training-time complexity budget used to cap one
+      whole-molecule batch by estimated packed graph size instead of only
+      molecule count.
+    - max_structure_cost_per_molecule: Optional per-molecule complexity budget
+      used to adaptively reduce sampled tail structures before batching.
     - molecule_balanced_sampling: Whether to batch runtime data by molecule instead of packed chunk.
     - dataset_sampling_strategy: Dataset-level training sampler. ``natural`` keeps
       dataset frequency proportional to molecule count while ``balanced`` interleaves
       batches across datasets.
+    - packed_molecule_view: Offline packed view name to read at train/eval time.
     - checkpoint_path: File path for best checkpoint.
     - log_path: Optional file path for training log output.
     """
 
     seed: int
     batch_size: int
+    eval_batch_size: int
     epochs: int
     learning_rate: float
     min_learning_rate: float
     weight_decay: float
+    gradient_clip_norm: float
     early_stopping_patience: int
     early_stopping_start_epoch: int
     bucketed_batching: bool
@@ -116,8 +133,14 @@ class TrainingConfig:
     top_mass_sample_strategy: str
     mixed_tail_top_fraction: float
     max_tail_samples_per_molecule: Optional[int]
+    max_focus_rank_samples_per_molecule: int
+    max_tail_rank_samples_per_molecule: int
+    max_rank_pairs_per_molecule: int
+    max_batch_cost: Optional[int]
+    max_structure_cost_per_molecule: Optional[int]
     molecule_balanced_sampling: bool
     dataset_sampling_strategy: str
+    packed_molecule_view: str
     checkpoint_path: str
     log_path: Optional[str]
 
@@ -327,6 +350,7 @@ class ConfigFactory:
             "num_atoms",
             "num_atoms_num_orbitals",
             "(num_atoms,num_orbitals)",
+            "active_space",
         }
         if bucket_key not in valid_bucket_keys:
             raise ValueError(
@@ -339,6 +363,9 @@ class ConfigFactory:
                 "training.batch_size must be at least 2 so molecule mini-batching "
                 "does not degenerate to single-molecule updates."
             )
+        eval_batch_size = int(training_payload.get("eval_batch_size", batch_size))
+        if eval_batch_size < 1:
+            raise ValueError("training.eval_batch_size must be at least 1.")
         use_top_mass_objective = bool(training_payload.get("use_top_mass_objective", False))
         validation_monitor = str(
             training_payload.get(
@@ -375,14 +402,44 @@ class ConfigFactory:
                 "training.dataset_sampling_strategy must be one of "
                 f"{sorted(valid_dataset_sampling_strategies)}, got {dataset_sampling_strategy}."
             )
+        max_batch_cost = training_payload.get("max_batch_cost")
+        if (max_batch_cost is not None) and (int(max_batch_cost) <= 0):
+            raise ValueError("training.max_batch_cost must be a positive integer when provided.")
+        max_structure_cost_per_molecule = training_payload.get("max_structure_cost_per_molecule")
+        if (max_structure_cost_per_molecule is not None) and (int(max_structure_cost_per_molecule) <= 0):
+            raise ValueError(
+                "training.max_structure_cost_per_molecule must be a positive integer when provided."
+            )
+        max_focus_rank_samples_per_molecule = int(
+            training_payload.get("max_focus_rank_samples_per_molecule", 0)
+        )
+        max_tail_rank_samples_per_molecule = int(
+            training_payload.get("max_tail_rank_samples_per_molecule", 0)
+        )
+        max_rank_pairs_per_molecule = int(training_payload.get("max_rank_pairs_per_molecule", 0))
+        if max_focus_rank_samples_per_molecule < 0:
+            raise ValueError("training.max_focus_rank_samples_per_molecule must be non-negative.")
+        if max_tail_rank_samples_per_molecule < 0:
+            raise ValueError("training.max_tail_rank_samples_per_molecule must be non-negative.")
+        if max_rank_pairs_per_molecule < 0:
+            raise ValueError("training.max_rank_pairs_per_molecule must be non-negative.")
+        packed_molecule_view = str(training_payload.get("packed_molecule_view", "full"))
+        valid_packed_views = {"full", "focus_only"}
+        if packed_molecule_view not in valid_packed_views:
+            raise ValueError(
+                "training.packed_molecule_view must be one of "
+                f"{sorted(valid_packed_views)}, got {packed_molecule_view}."
+            )
 
         return TrainingConfig(
             seed=int(training_payload["seed"]),
             batch_size=batch_size,
+            eval_batch_size=eval_batch_size,
             epochs=int(training_payload["epochs"]),
             learning_rate=float(training_payload["learning_rate"]),
             min_learning_rate=float(training_payload.get("min_learning_rate", 1.0e-6)),
             weight_decay=float(training_payload["weight_decay"]),
+            gradient_clip_norm=float(training_payload.get("gradient_clip_norm", 0.0)),
             early_stopping_patience=int(training_payload.get("early_stopping_patience", 0)),
             early_stopping_start_epoch=int(training_payload.get("early_stopping_start_epoch", 0)),
             bucketed_batching=bool(training_payload.get("bucketed_batching", True)),
@@ -438,8 +495,22 @@ class ConfigFactory:
                 if training_payload.get("max_tail_samples_per_molecule") is None
                 else int(training_payload["max_tail_samples_per_molecule"])
             ),
+            max_focus_rank_samples_per_molecule=max_focus_rank_samples_per_molecule,
+            max_tail_rank_samples_per_molecule=max_tail_rank_samples_per_molecule,
+            max_rank_pairs_per_molecule=max_rank_pairs_per_molecule,
+            max_batch_cost=(
+                None
+                if max_batch_cost is None
+                else int(max_batch_cost)
+            ),
+            max_structure_cost_per_molecule=(
+                None
+                if max_structure_cost_per_molecule is None
+                else int(max_structure_cost_per_molecule)
+            ),
             molecule_balanced_sampling=bool(training_payload.get("molecule_balanced_sampling", False)),
             dataset_sampling_strategy=dataset_sampling_strategy,
+            packed_molecule_view=packed_molecule_view,
             checkpoint_path=str(training_payload["checkpoint_path"]),
             log_path=(
                 None

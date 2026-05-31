@@ -2,6 +2,7 @@
 #SBATCH -J e3vb_train
 #SBATCH -p pc
 #SBATCH -w pc001
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 #SBATCH -t 48:00:00
 #SBATCH -o /pool1/home/ysxin/E3nn/E3VB/logs/%x_%j.slurm.out

@@ -171,3 +171,38 @@ def selectTopMassStructureIndices(
     if selected.size == 0:
         return np.zeros((0,), dtype=np.int32)
     return np.sort(selected.astype(np.int32, copy=False))
+
+
+def capTopMassTailSamplesByBudget(
+    num_structures: int,
+    num_focus_structures: int,
+    structure_cost: float,
+    max_tail_samples: int | None,
+    max_structure_cost: int | None,
+) -> int | None:
+    """
+    Derive one effective tail-sampling cap from a per-molecule complexity budget.
+
+    The budget is expressed in the same heuristic cost units as the runtime
+    batch planner. Focus structures are always preserved; only tail capacity is
+    reduced when the estimated per-molecule cost would otherwise exceed the
+    configured limit.
+    """
+
+    num_structures = max(int(num_structures), 0)
+    num_focus_structures = min(max(int(num_focus_structures), 0), num_structures)
+    tail_count = max(num_structures - num_focus_structures, 0)
+    if tail_count == 0:
+        return 0 if max_tail_samples is not None else None
+
+    effective_tail_cap = tail_count if max_tail_samples is None else min(int(max_tail_samples), tail_count)
+    if (max_structure_cost is None) or (int(max_structure_cost) <= 0):
+        return effective_tail_cap
+
+    structure_cost = max(float(structure_cost), 1.0)
+    max_total_structures = max(
+        num_focus_structures,
+        int(np.floor(float(max_structure_cost) / structure_cost)),
+    )
+    budget_tail_cap = max(max_total_structures - num_focus_structures, 0)
+    return min(effective_tail_cap, budget_tail_cap)

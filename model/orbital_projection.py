@@ -6,6 +6,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import jraph
+import numpy as np
 
 
 @dataclass
@@ -34,7 +35,12 @@ class OrbitalProjectionConfig:
 
 class LocalOrbitalProjector(nnx.Module):
     """
-    Project vector channels onto local atom frames.
+    Project vector channels onto chemistry-aware local atom frames.
+
+    Frame semantics:
+    - e1: sigma-axis direction defined by the nearest bonded neighbor
+    - e2: in-plane direction orthogonal to e1
+    - e3: plane normal completing the right-handed frame
     """
 
     def __init__(self):
@@ -53,8 +59,8 @@ class LocalOrbitalProjector(nnx.Module):
         - Normalized tensor, shape [..., 3].
         """
 
-        norm = jnp.linalg.norm(value, axis=-1, keepdims=True)
-        return value / jnp.maximum(norm, 1e-8)
+        squared_norm = jnp.sum(jnp.square(value), axis=-1, keepdims=True)
+        return value * jax.lax.rsqrt(squared_norm + 1.0e-12)
 
     def chooseReferenceAxis(self, direction: jnp.ndarray) -> jnp.ndarray:
         """
@@ -87,17 +93,80 @@ class LocalOrbitalProjector(nnx.Module):
         orthogonal = reference - jnp.dot(reference, direction) * direction
         return self.normalizeVector(orthogonal)
 
-    def buildFrameForOneGraph(self, positions: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def orderedFrameNeighborCandidates(
+        self,
+        atom_id: int,
+        distance: jnp.ndarray,
+        atom_numbers: jnp.ndarray | None = None,
+        active_atom_mask: jnp.ndarray | None = None,
+        bonded_adjacency: jnp.ndarray | None = None,
+    ) -> list[int]:
         """
-        Build local frames for one molecular graph.
+        Rank frame-defining neighbor candidates by chemistry-aware priority.
+        """
+
+        num_atoms = int(distance.shape[0])
+        heavy_mask = (
+            np.asarray(atom_numbers, dtype=np.int32) > 1
+            if atom_numbers is not None
+            else np.ones((num_atoms,), dtype=bool)
+        )
+        active_mask = (
+            np.asarray(active_atom_mask, dtype=bool)
+            if active_atom_mask is not None
+            else np.zeros((num_atoms,), dtype=bool)
+        )
+        bonded_mask = (
+            np.asarray(bonded_adjacency[atom_id], dtype=bool)
+            if bonded_adjacency is not None
+            else np.ones((num_atoms,), dtype=bool)
+        )
+        base_mask = np.ones((num_atoms,), dtype=bool)
+        base_mask[atom_id] = False
+
+        priority_masks: list[np.ndarray] = []
+        if bool(active_mask[atom_id]):
+            priority_masks.append(base_mask & bonded_mask & heavy_mask & active_mask)
+        priority_masks.append(base_mask & bonded_mask & heavy_mask)
+        priority_masks.append(base_mask & heavy_mask)
+        priority_masks.append(base_mask & bonded_mask)
+        priority_masks.append(base_mask)
+
+        atom_distance = np.asarray(distance[atom_id], dtype=np.float32)
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for mask in priority_masks:
+            candidate_ids = np.flatnonzero(mask)
+            if candidate_ids.size == 0:
+                continue
+            ranked = candidate_ids[np.argsort(atom_distance[candidate_ids])]
+            for neighbor_id in ranked.tolist():
+                neighbor_id = int(neighbor_id)
+                if neighbor_id not in seen:
+                    ordered.append(neighbor_id)
+                    seen.add(neighbor_id)
+        return ordered
+
+    def buildFrameForOneGraph(
+        self,
+        positions: jnp.ndarray,
+        atom_numbers: jnp.ndarray | None = None,
+        active_atom_mask: jnp.ndarray | None = None,
+        bonded_adjacency: jnp.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Build one chemistry-aware local frame per atom for one molecular graph.
 
         Arguments:
         - positions: Atom coordinates for one graph, shape [num_atoms, 3].
+        - atom_numbers: Optional atomic numbers, shape [num_atoms].
+        - active_atom_mask: Optional active-atom indicator, shape [num_atoms].
+        - bonded_adjacency: Optional bonded adjacency, shape [num_atoms, num_atoms].
 
         Returns:
-        - e1: First local axis, shape [num_atoms, 3].
-        - e2: Second local axis, shape [num_atoms, 3].
-        - e3: Third local axis, shape [num_atoms, 3].
+        - e1: Sigma-axis direction, shape [num_atoms, 3].
+        - e2: In-plane perpendicular direction, shape [num_atoms, 3].
+        - e3: Plane-normal direction, shape [num_atoms, 3].
         """
 
         num_atoms = positions.shape[0]
@@ -120,34 +189,46 @@ class LocalOrbitalProjector(nnx.Module):
         default_e3 = jnp.asarray([0.0, 0.0, 1.0], dtype=positions.dtype)
 
         for atom_id in range(num_atoms):
-            neighbor_first = int(nearest[atom_id, 0].item())
-            r_first = positions[neighbor_first] - positions[atom_id]
-            e1 = self.normalizeVector(r_first)
-
-            if num_atoms >= 3:
-                neighbor_second = int(nearest[atom_id, 1].item())
-                r_second = positions[neighbor_second] - positions[atom_id]
-                projected = r_second - jnp.dot(r_second, e1) * e1
-                if float(jnp.linalg.norm(projected)) < 1e-8:
-                    e2 = self.orthogonalDirection(e1)
-                else:
-                    e2 = self.normalizeVector(projected)
-            elif num_atoms == 2:
-                e2 = self.orthogonalDirection(e1)
-            else:
-                e1 = default_e1
-                e2 = default_e2
-                e3 = default_e3
-                e1_list.append(e1)
-                e2_list.append(e2)
-                e3_list.append(e3)
+            if num_atoms == 1:
+                e1_list.append(default_e1)
+                e2_list.append(default_e2)
+                e3_list.append(default_e3)
                 continue
 
-            e3 = self.normalizeVector(jnp.cross(e1, e2))
-            e2 = self.normalizeVector(jnp.cross(e3, e1))
-            e1_list.append(e1)
-            e2_list.append(e2)
-            e3_list.append(e3)
+            ranked_neighbors = self.orderedFrameNeighborCandidates(
+                atom_id=atom_id,
+                distance=distance,
+                atom_numbers=atom_numbers,
+                active_atom_mask=active_atom_mask,
+                bonded_adjacency=bonded_adjacency,
+            )
+            if len(ranked_neighbors) == 0:
+                e1_list.append(default_e1)
+                e2_list.append(default_e2)
+                e3_list.append(default_e3)
+                continue
+
+            neighbor_first = int(ranked_neighbors[0])
+            sigma_axis = self.normalizeVector(positions[neighbor_first] - positions[atom_id])
+
+            inplane_seed = None
+            if num_atoms >= 3:
+                for neighbor_id in ranked_neighbors[1:]:
+                    candidate = positions[int(neighbor_id)] - positions[atom_id]
+                    projected = candidate - jnp.dot(candidate, sigma_axis) * sigma_axis
+                    if float(jnp.linalg.norm(projected)) >= 1e-8:
+                        inplane_seed = self.normalizeVector(projected)
+                        break
+
+            if inplane_seed is None:
+                inplane_seed = self.orthogonalDirection(sigma_axis)
+
+            plane_normal = self.normalizeVector(jnp.cross(sigma_axis, inplane_seed))
+            inplane_perp = self.normalizeVector(jnp.cross(plane_normal, sigma_axis))
+
+            e1_list.append(sigma_axis)
+            e2_list.append(inplane_perp)
+            e3_list.append(plane_normal)
 
         return (
             jnp.stack(e1_list, axis=0),
@@ -202,14 +283,14 @@ class LocalOrbitalProjector(nnx.Module):
 
         Arguments:
         - vector_feature: Atom 1o channels, shape [total_atoms, vector_dim, 3].
-        - e1: First local axis, shape [total_atoms, 3].
-        - e2: Second local axis, shape [total_atoms, 3].
-        - e3: Third local axis, shape [total_atoms, 3].
+        - e1: Sigma-axis direction, shape [total_atoms, 3].
+        - e2: In-plane perpendicular direction, shape [total_atoms, 3].
+        - e3: Plane-normal direction, shape [total_atoms, 3].
 
         Returns:
-        - q1: Projection on e1, shape [total_atoms, vector_dim].
-        - q2: Projection on e2, shape [total_atoms, vector_dim].
-        - q3: Projection on e3, shape [total_atoms, vector_dim].
+        - q1: Projection on sigma-axis, shape [total_atoms, vector_dim].
+        - q2: Projection on in-plane perpendicular axis, shape [total_atoms, vector_dim].
+        - q3: Projection on plane-normal axis, shape [total_atoms, vector_dim].
         """
 
         q1 = jnp.einsum("ncd,nd->nc", vector_feature, e1)
@@ -381,6 +462,28 @@ class ActiveSlotMatcher(nnx.Module):
             rngs=rngs,
         )
         self.score_linear2 = nnx.Linear(config.slot_query_dim, 1, rngs=rngs)
+        self.role_linear = nnx.Linear(3, config.slot_query_dim, rngs=rngs)
+        self.direction_basis_linear1 = nnx.Linear(
+            config.slot_query_dim,
+            config.slot_query_dim,
+            rngs=rngs,
+        )
+        self.direction_basis_linear2 = nnx.Linear(config.slot_query_dim, 3, rngs=rngs)
+        self.lp_basis_linear1 = nnx.Linear(
+            config.slot_query_dim,
+            config.slot_query_dim,
+            rngs=rngs,
+        )
+        self.lp_basis_linear2 = nnx.Linear(config.slot_query_dim, 3, rngs=rngs)
+        self.prior_gate_linear = nnx.Linear(config.slot_query_dim, 2, rngs=rngs)
+        self.direction_residual_scale = 0.1
+        direction_input_dim = config.scalar_dim + config.vector_dim + config.slot_query_dim + 3
+        self.direction_feature_linear1 = nnx.Linear(
+            direction_input_dim,
+            config.slot_dim,
+            rngs=rngs,
+        )
+        self.direction_feature_linear2 = nnx.Linear(config.slot_dim, config.slot_dim, rngs=rngs)
 
     def activate(self, tensor: jnp.ndarray) -> jnp.ndarray:
         """
@@ -395,12 +498,26 @@ class ActiveSlotMatcher(nnx.Module):
 
         return jax.nn.silu(tensor)
 
-    def buildSlotQuery(self, scalar_feature: jnp.ndarray) -> jnp.ndarray:
+    def normalizeVector(self, value: jnp.ndarray) -> jnp.ndarray:
+        """
+        Normalize vectors along the last axis.
+        """
+
+        squared_norm = jnp.sum(jnp.square(value), axis=-1, keepdims=True)
+        return value * jax.lax.rsqrt(squared_norm + 1.0e-12)
+
+    def buildSlotQuery(
+        self,
+        scalar_feature: jnp.ndarray,
+        slot_role_prior: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
         """
         Build all slot queries for every atom.
 
         Arguments:
         - scalar_feature: Atom scalar channels, shape [total_atoms, scalar_dim].
+        - slot_role_prior: Optional role prior [bond, lone-pair, radical],
+          shape [total_atoms, max_active_slots, 3].
 
         Returns:
         - Slot query tensor, shape [total_atoms, max_active_slots, slot_query_dim].
@@ -422,7 +539,88 @@ class ActiveSlotMatcher(nnx.Module):
         query_input = jnp.concatenate([scalar_expand, slot_expand], axis=-1)
         query = self.activate(self.query_linear1(query_input))
         query = self.query_linear2(query)
+        if slot_role_prior is not None:
+            query = query + self.role_linear(slot_role_prior)
         return query
+
+    def combineLocalBasis(
+        self,
+        coefficient: jnp.ndarray,
+        e1: jnp.ndarray,
+        e2: jnp.ndarray,
+        e3: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Combine local-frame axes into one continuous learned direction.
+
+        Arguments:
+        - coefficient: Local coefficients, shape [total_atoms, max_active_slots, 3].
+        - e1/e2/e3: Local frame axes, each shape [total_atoms, 3].
+
+        Returns:
+        - Raw direction tensor, shape [total_atoms, max_active_slots, 3].
+        """
+
+        return (
+            coefficient[..., 0:1] * e1[:, None, :]
+            + coefficient[..., 1:2] * e2[:, None, :]
+            + coefficient[..., 2:3] * e3[:, None, :]
+        )
+
+    def buildDirectionalSlots(
+        self,
+        scalar_feature: jnp.ndarray,
+        vector_feature: jnp.ndarray,
+        e1: jnp.ndarray,
+        e2: jnp.ndarray,
+        e3: jnp.ndarray,
+        query: jnp.ndarray,
+        slot_role_prior: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        """
+        Predict one continuous local direction and feature for every active slot.
+
+        The direction is built from local-frame axes with role-guided soft priors:
+        cross-atom active pairs bias toward the local pi axis e3, while same-atom
+        active pairs get a separately learned lone-pair direction.
+        """
+
+        total_atoms = scalar_feature.shape[0]
+        if slot_role_prior is None:
+            slot_role_prior = jnp.zeros(
+                (total_atoms, self.config.max_active_slots, 3),
+                dtype=scalar_feature.dtype,
+            )
+        basis_hidden = self.activate(self.direction_basis_linear1(query))
+        learned_coefficient = self.direction_basis_linear2(basis_hidden)
+        learned_direction = self.combineLocalBasis(learned_coefficient, e1, e2, e3)
+
+        lp_hidden = self.activate(self.lp_basis_linear1(query))
+        lp_coefficient = self.lp_basis_linear2(lp_hidden)
+        lp_direction = self.normalizeVector(self.combineLocalBasis(lp_coefficient, e1, e2, e3))
+
+        role_gate = jax.nn.sigmoid(self.prior_gate_linear(query))
+        bond_prior = e3[:, None, :]
+        bond_weight = slot_role_prior[..., 0:1] * role_gate[..., 0:1]
+        lp_weight = slot_role_prior[..., 1:2] * role_gate[..., 1:2]
+        raw_direction = learned_direction + bond_weight * bond_prior + lp_weight * lp_direction
+        direction = self.normalizeVector(raw_direction)
+
+        projected_vector = jnp.einsum("ncd,nsd->nsc", vector_feature, direction)
+        scalar_expand = jnp.repeat(
+            scalar_feature[:, None, :],
+            repeats=self.config.max_active_slots,
+            axis=1,
+        )
+        feature_input = jnp.concatenate(
+            [scalar_expand, projected_vector, query, slot_role_prior],
+            axis=-1,
+        )
+        feature = self.activate(self.direction_feature_linear1(feature_input))
+        feature = self.direction_feature_linear2(feature)
+        feature = jnp.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0)
+        direction = jnp.nan_to_num(direction, nan=0.0, posinf=0.0, neginf=0.0)
+        return {"direction": direction, "feature": feature}
 
     def matchCandidates(
         self,
@@ -458,29 +656,57 @@ class ActiveSlotMatcher(nnx.Module):
     def __call__(
         self,
         scalar_feature: jnp.ndarray,
+        vector_feature: jnp.ndarray,
+        e1: jnp.ndarray,
+        e2: jnp.ndarray,
+        e3: jnp.ndarray,
         candidates: jnp.ndarray,
         active_slot_capacity: jnp.ndarray,
+        slot_role_prior: jnp.ndarray | None = None,
     ) -> dict[str, jnp.ndarray]:
         """
         Build slot-matched active features for each atom.
 
         Arguments:
         - scalar_feature: Atom scalar channels, shape [total_atoms, scalar_dim].
+        - vector_feature: Atom vector channels, shape [total_atoms, vector_dim, 3].
+        - e1/e2/e3: Local frame axes, each shape [total_atoms, 3].
         - candidates: Local candidates, shape [total_atoms, 4, slot_dim].
         - active_slot_capacity: Number of active slots on each atom, shape [total_atoms].
+        - slot_role_prior: Optional role prior [bond, lone-pair, radical],
+          shape [total_atoms, max_active_slots, 3].
 
         Returns:
         - Dictionary:
           slot_feature: [total_atoms, max_active_slots, slot_dim]
           alpha: [total_atoms, max_active_slots, 4]
+          slot_direction: [total_atoms, max_active_slots, 3]
         """
 
-        query = self.buildSlotQuery(scalar_feature)
+        query = self.buildSlotQuery(
+            scalar_feature=scalar_feature,
+            slot_role_prior=slot_role_prior,
+        )
         slot_feature, alpha = self.matchCandidates(query, candidates)
+        directional = self.buildDirectionalSlots(
+            scalar_feature=scalar_feature,
+            vector_feature=vector_feature,
+            e1=e1,
+            e2=e2,
+            e3=e3,
+            query=query,
+            slot_role_prior=slot_role_prior,
+        )
+        slot_feature = slot_feature + self.direction_residual_scale * directional["feature"]
         slot_id = jnp.arange(self.config.max_active_slots)[None, :]
         mask = (slot_id < active_slot_capacity[:, None]).astype(slot_feature.dtype)
         masked_slot_feature = slot_feature * mask[:, :, None]
-        return {"slot_feature": masked_slot_feature, "alpha": alpha}
+        masked_direction = directional["direction"] * mask[:, :, None]
+        return {
+            "slot_feature": masked_slot_feature,
+            "alpha": alpha,
+            "slot_direction": masked_direction,
+        }
 
 
 class AtomToOrbitalMapper(nnx.Module):
@@ -635,6 +861,10 @@ class AtomToOrbitalProjectionStack(nnx.Module):
     def buildOrbitalFeatureFromProjections(
         self,
         scalar_feature: jnp.ndarray,
+        vector_feature: jnp.ndarray,
+        e1: jnp.ndarray,
+        e2: jnp.ndarray,
+        e3: jnp.ndarray,
         q1: jnp.ndarray,
         q2: jnp.ndarray,
         q3: jnp.ndarray,
@@ -642,12 +872,15 @@ class AtomToOrbitalProjectionStack(nnx.Module):
         orbital_atom_index: jnp.ndarray,
         orbital_role: jnp.ndarray,
         active_slot_index: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        slot_role_prior: jnp.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Build one orbital feature tensor from one set of local projections.
 
         Arguments:
         - scalar_feature: Atom scalar channels, shape [total_atoms, scalar_dim].
+        - vector_feature: Atom vector channels, shape [total_atoms, vector_dim, 3].
+        - e1/e2/e3: Local frame axes, each shape [total_atoms, 3].
         - q1: Local projection on e1, shape [total_atoms, vector_dim].
         - q2: Local projection on e2, shape [total_atoms, vector_dim].
         - q3: Local projection on e3, shape [total_atoms, vector_dim].
@@ -655,10 +888,13 @@ class AtomToOrbitalProjectionStack(nnx.Module):
         - orbital_atom_index: Orbital-to-atom map, shape [total_orbitals, 2].
         - orbital_role: Orbital role ids, shape [total_orbitals].
         - active_slot_index: Active slot ids per orbital, shape [total_orbitals].
+        - slot_role_prior: Optional role prior [bond, lone-pair, radical],
+          shape [total_atoms, max_active_slots, 3].
 
         Returns:
         - orbital_feature: [total_orbitals, orbital_feature_dim]
         - slot_alpha: [total_atoms, max_active_slots, 4]
+        - slot_direction: [total_atoms, max_active_slots, 3]
         """
 
         local_vector_feature = jnp.concatenate([q1, q2, q3], axis=-1)
@@ -670,8 +906,13 @@ class AtomToOrbitalProjectionStack(nnx.Module):
         )
         matched = self.slot_matcher(
             scalar_feature=scalar_feature,
+            vector_feature=vector_feature,
+            e1=e1,
+            e2=e2,
+            e3=e3,
             candidates=candidates["candidates"],
             active_slot_capacity=active_capacity,
+            slot_role_prior=slot_role_prior,
         )
         orbital_feature = self.mapper(
             scalar_feature=scalar_feature,
@@ -681,7 +922,82 @@ class AtomToOrbitalProjectionStack(nnx.Module):
             orbital_role=orbital_role,
             active_slot_index=active_slot_index,
         )
-        return orbital_feature, matched["alpha"]
+        return orbital_feature, matched["alpha"], matched["slot_direction"]
+
+    def buildActiveSlotRolePrior(
+        self,
+        num_atoms: int,
+        active_rumer_graph: jraph.GraphsTuple | None,
+        active_orbital_index: jnp.ndarray | None,
+        orbital_atom_index: jnp.ndarray,
+        orbital_role: jnp.ndarray,
+        active_slot_index: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Build per-atom active-slot role priors from active Rumer pairing topology.
+
+        Role order is [bond, lone-pair, radical]. Cross-atom active pairs are
+        treated as bond-like; same-atom active pairs are treated as lone-pair-like.
+        Slots without active pair incidence receive a radical/unpaired prior.
+        """
+
+        prior_shape = (num_atoms, self.config.max_active_slots, 3)
+        if active_rumer_graph is None or active_orbital_index is None:
+            return jnp.zeros(prior_shape, dtype=jnp.float32)
+
+        num_active = active_orbital_index.shape[0]
+        safe_active_orbital = jnp.clip(active_orbital_index, 0, orbital_role.shape[0] - 1)
+        active_owner = orbital_atom_index[safe_active_orbital, 0]
+        active_slot = active_slot_index[safe_active_orbital]
+        active_valid = (
+            (orbital_role[safe_active_orbital] == 2)
+            & (active_slot >= 0)
+            & (active_slot < self.config.max_active_slots)
+        )
+
+        sender = active_rumer_graph.senders
+        receiver = active_rumer_graph.receivers
+        edge_type = active_rumer_graph.edges["edge_type"]
+        edge_valid = edge_type == 2
+        sender_owner = active_owner[sender]
+        receiver_owner = active_owner[receiver]
+        same_atom_pair = edge_valid & (sender_owner == receiver_owner)
+        cross_atom_pair = edge_valid & (sender_owner != receiver_owner)
+
+        bond_incidence = (
+            jraph.segment_sum(cross_atom_pair.astype(jnp.float32), sender, num_segments=num_active)
+            + jraph.segment_sum(cross_atom_pair.astype(jnp.float32), receiver, num_segments=num_active)
+        )
+        lone_pair_incidence = (
+            jraph.segment_sum(same_atom_pair.astype(jnp.float32), sender, num_segments=num_active)
+            + jraph.segment_sum(same_atom_pair.astype(jnp.float32), receiver, num_segments=num_active)
+        )
+        incidence_total = bond_incidence + lone_pair_incidence
+        active_prior = jnp.stack(
+            [
+                bond_incidence / jnp.maximum(incidence_total, 1.0),
+                lone_pair_incidence / jnp.maximum(incidence_total, 1.0),
+                (incidence_total <= 0.0).astype(jnp.float32),
+            ],
+            axis=-1,
+        )
+        active_prior = active_prior * active_valid[:, None].astype(jnp.float32)
+
+        safe_slot = jnp.clip(active_slot, 0, self.config.max_active_slots - 1)
+        flat_slot_index = active_owner * self.config.max_active_slots + safe_slot
+        flat_size = num_atoms * self.config.max_active_slots
+        flat_prior = jraph.segment_sum(
+            active_prior,
+            flat_slot_index,
+            num_segments=flat_size,
+        )
+        flat_count = jraph.segment_sum(
+            active_valid.astype(jnp.float32),
+            flat_slot_index,
+            num_segments=flat_size,
+        )
+        flat_prior = flat_prior / jnp.maximum(flat_count[:, None], 1.0)
+        return flat_prior.reshape(prior_shape)
 
     def countActiveSlotsPerAtom(
         self,
@@ -714,6 +1030,8 @@ class AtomToOrbitalProjectionStack(nnx.Module):
         orbital_atom_index: jnp.ndarray,
         orbital_role: jnp.ndarray,
         active_slot_index: jnp.ndarray,
+        active_rumer_graph: jraph.GraphsTuple | None = None,
+        active_orbital_index: jnp.ndarray | None = None,
         local_frame_e1: jnp.ndarray | None = None,
         local_frame_e2: jnp.ndarray | None = None,
         local_frame_e3: jnp.ndarray | None = None,
@@ -729,6 +1047,9 @@ class AtomToOrbitalProjectionStack(nnx.Module):
         - orbital_atom_index: Orbital-to-atom map, shape [total_orbitals, 2].
         - orbital_role: Orbital role ids, shape [total_orbitals].
         - active_slot_index: Active slot ids per orbital, shape [total_orbitals].
+        - active_rumer_graph: Optional active-only Rumer graph used to infer
+          active-slot role priors.
+        - active_orbital_index: Optional full-orbital indices for active graph nodes.
         - local_frame_e1: Optional cached local axis e1, shape [total_atoms, 3].
         - local_frame_e2: Optional cached local axis e2, shape [total_atoms, 3].
         - local_frame_e3: Optional cached local axis e3, shape [total_atoms, 3].
@@ -738,6 +1059,8 @@ class AtomToOrbitalProjectionStack(nnx.Module):
           orbital_feature: [total_orbitals, orbital_feature_dim]
           orbital_feature_q3_flipped: [total_orbitals, orbital_feature_dim]
           slot_alpha: [total_atoms, max_active_slots, 4]
+          slot_direction: [total_atoms, max_active_slots, 3]
+          slot_role_prior: [total_atoms, max_active_slots, 3]
           active_capacity: [total_atoms]
         """
 
@@ -746,12 +1069,18 @@ class AtomToOrbitalProjectionStack(nnx.Module):
             and (local_frame_e2 is not None)
             and (local_frame_e3 is not None)
         ):
+            local_frame_e1 = jnp.nan_to_num(local_frame_e1, nan=0.0, posinf=0.0, neginf=0.0)
+            local_frame_e2 = jnp.nan_to_num(local_frame_e2, nan=0.0, posinf=0.0, neginf=0.0)
+            local_frame_e3 = jnp.nan_to_num(local_frame_e3, nan=0.0, posinf=0.0, neginf=0.0)
             q1, q2, q3 = self.local_projector.projectVectorChannels(
                 vector_feature=vector_feature,
                 e1=local_frame_e1,
                 e2=local_frame_e2,
                 e3=local_frame_e3,
             )
+            q1 = jnp.nan_to_num(q1, nan=0.0, posinf=0.0, neginf=0.0)
+            q2 = jnp.nan_to_num(q2, nan=0.0, posinf=0.0, neginf=0.0)
+            q3 = jnp.nan_to_num(q3, nan=0.0, posinf=0.0, neginf=0.0)
             local_projection = {
                 "e1": local_frame_e1,
                 "e2": local_frame_e2,
@@ -766,13 +1095,29 @@ class AtomToOrbitalProjectionStack(nnx.Module):
                 vector_feature=vector_feature,
                 num_atoms_per_graph=num_atoms_per_graph,
             )
+            local_projection = {
+                key: jnp.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+                for key, value in local_projection.items()
+            }
         active_capacity = self.countActiveSlotsPerAtom(
             num_atoms=scalar_feature.shape[0],
             orbital_atom_index=orbital_atom_index,
             orbital_role=orbital_role,
         )
-        orbital_feature, slot_alpha = self.buildOrbitalFeatureFromProjections(
+        slot_role_prior = self.buildActiveSlotRolePrior(
+            num_atoms=scalar_feature.shape[0],
+            active_rumer_graph=active_rumer_graph,
+            active_orbital_index=active_orbital_index,
+            orbital_atom_index=orbital_atom_index,
+            orbital_role=orbital_role,
+            active_slot_index=active_slot_index,
+        )
+        orbital_feature, slot_alpha, slot_direction = self.buildOrbitalFeatureFromProjections(
             scalar_feature=scalar_feature,
+            vector_feature=vector_feature,
+            e1=local_projection["e1"],
+            e2=local_projection["e2"],
+            e3=local_projection["e3"],
             q1=local_projection["q1"],
             q2=local_projection["q2"],
             q3=local_projection["q3"],
@@ -780,9 +1125,14 @@ class AtomToOrbitalProjectionStack(nnx.Module):
             orbital_atom_index=orbital_atom_index,
             orbital_role=orbital_role,
             active_slot_index=active_slot_index,
+            slot_role_prior=slot_role_prior,
         )
-        orbital_feature_q3_flipped, _ = self.buildOrbitalFeatureFromProjections(
+        orbital_feature_q3_flipped, _, _ = self.buildOrbitalFeatureFromProjections(
             scalar_feature=scalar_feature,
+            vector_feature=vector_feature,
+            e1=local_projection["e1"],
+            e2=local_projection["e2"],
+            e3=-local_projection["e3"],
             q1=local_projection["q1"],
             q2=local_projection["q2"],
             q3=-local_projection["q3"],
@@ -790,10 +1140,13 @@ class AtomToOrbitalProjectionStack(nnx.Module):
             orbital_atom_index=orbital_atom_index,
             orbital_role=orbital_role,
             active_slot_index=active_slot_index,
+            slot_role_prior=slot_role_prior,
         )
         return {
             "orbital_feature": orbital_feature,
             "orbital_feature_q3_flipped": orbital_feature_q3_flipped,
             "slot_alpha": slot_alpha,
+            "slot_direction": slot_direction,
+            "slot_role_prior": slot_role_prior,
             "active_capacity": active_capacity,
         }

@@ -40,7 +40,7 @@ class RumerEncoderConfig:
     - layers: Number of Rumer message layers.
     - mode: ``full`` keeps the original full-graph path, while
       ``active_only_low_risk`` runs message passing only on active orbitals and
-      keeps background orbitals in a lightweight bypass readout.
+      keeps background atoms in a lightweight bypass readout.
     """
 
     orbital_feature_dim: int
@@ -301,27 +301,25 @@ class RumerGraphEncoder(nnx.Module):
         active = self.active_linear2(active)
         return jnp.concatenate([background, active], axis=-1)
 
-    def buildBackgroundBypass(
+    def buildAtomBackgroundBypass(
         self,
-        orbital_feature: jnp.ndarray,
-        n_node: jnp.ndarray,
-        orbital_role: jnp.ndarray,
+        atom_background_feature: jnp.ndarray,
+        num_atoms_per_graph: jnp.ndarray,
+        background_atom_mask: jnp.ndarray,
     ) -> jnp.ndarray:
         """
-        Build one lightweight background embedding without Rumer message passing.
+        Build one lightweight atom-level background embedding without Rumer message passing.
         """
 
         graph_index = self.graphIndexFromCounts(
-            counts=n_node,
-            total_nodes=orbital_feature.shape[0],
+            counts=num_atoms_per_graph,
+            total_nodes=atom_background_feature.shape[0],
         )
-        num_graphs = int(n_node.shape[0])
-        background_mask = (orbital_role != 2).astype(jnp.float32)
-        encoded_background = self.input_linear(orbital_feature)
+        num_graphs = int(num_atoms_per_graph.shape[0])
         background = self.maskedMeanPool(
-            node_feature=encoded_background,
+            node_feature=atom_background_feature,
             graph_index=graph_index,
-            mask=background_mask,
+            mask=background_atom_mask,
             num_graphs=num_graphs,
         )
         background = self.activate(self.background_linear1(background))
@@ -353,19 +351,20 @@ class RumerGraphEncoder(nnx.Module):
 
     def buildActiveLowRiskReadout(
         self,
-        full_orbital_feature: jnp.ndarray,
+        atom_background_feature: jnp.ndarray,
+        background_atom_mask: jnp.ndarray,
+        num_atoms_per_graph: jnp.ndarray,
         active_rumer_graph: jraph.GraphsTuple,
-        orbital_role: jnp.ndarray,
         num_orbitals_per_graph: jnp.ndarray,
     ) -> jnp.ndarray:
         """
         Fuse background bypass embeddings with active-only graph embeddings.
         """
 
-        background = self.buildBackgroundBypass(
-            orbital_feature=full_orbital_feature,
-            n_node=num_orbitals_per_graph,
-            orbital_role=orbital_role,
+        background = self.buildAtomBackgroundBypass(
+            atom_background_feature=atom_background_feature,
+            num_atoms_per_graph=num_atoms_per_graph,
+            background_atom_mask=background_atom_mask,
         )
         active_node_feature = self.encodeNodeFeature(active_rumer_graph)
         active = self.poolActiveNodeFeature(
@@ -396,8 +395,9 @@ class RumerGraphEncoder(nnx.Module):
         orbital_role: jnp.ndarray,
         active_rumer_graph: jraph.GraphsTuple | None = None,
         active_rumer_graph_q3_flipped: jraph.GraphsTuple | None = None,
-        full_orbital_feature: jnp.ndarray | None = None,
-        full_orbital_feature_q3_flipped: jnp.ndarray | None = None,
+        atom_background_feature: jnp.ndarray | None = None,
+        background_atom_mask: jnp.ndarray | None = None,
+        num_atoms_per_graph: jnp.ndarray | None = None,
         num_orbitals_per_graph: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         """
@@ -422,24 +422,27 @@ class RumerGraphEncoder(nnx.Module):
             if (
                 active_rumer_graph is None
                 or active_rumer_graph_q3_flipped is None
-                or full_orbital_feature is None
-                or full_orbital_feature_q3_flipped is None
+                or atom_background_feature is None
+                or background_atom_mask is None
+                or num_atoms_per_graph is None
                 or num_orbitals_per_graph is None
             ):
                 raise ValueError(
-                    "Active-only low-risk Rumer mode requires active graphs, full orbital features, "
-                    "and num_orbitals_per_graph."
+                    "Active-only low-risk Rumer mode requires active graphs, atom background features, "
+                    "atom/orbital count tensors, and background atom masks."
                 )
             fused = self.buildActiveLowRiskReadout(
-                full_orbital_feature=full_orbital_feature,
+                atom_background_feature=atom_background_feature,
+                background_atom_mask=background_atom_mask,
+                num_atoms_per_graph=num_atoms_per_graph,
                 active_rumer_graph=active_rumer_graph,
-                orbital_role=orbital_role,
                 num_orbitals_per_graph=num_orbitals_per_graph,
             )
             fused_q3_flipped = self.buildActiveLowRiskReadout(
-                full_orbital_feature=full_orbital_feature_q3_flipped,
+                atom_background_feature=atom_background_feature,
+                background_atom_mask=background_atom_mask,
+                num_atoms_per_graph=num_atoms_per_graph,
                 active_rumer_graph=active_rumer_graph_q3_flipped,
-                orbital_role=orbital_role,
                 num_orbitals_per_graph=num_orbitals_per_graph,
             )
         else:

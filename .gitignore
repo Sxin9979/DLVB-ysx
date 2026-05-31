@@ -26,6 +26,9 @@ out_file/
 processed/
 raw/
 .cache/
+tmp_preprocess_outputs/
+tmp_single_xmo_input/
+tmp_unified_smoke_input/
 
 # Model artifacts
 checkpoints/

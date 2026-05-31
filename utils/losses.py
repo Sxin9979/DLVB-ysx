@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 
@@ -296,6 +297,101 @@ def crossSetMarginLoss(
     )
 
 
+def sampledTopKMarginLoss(
+    prediction: jnp.ndarray,
+    target: jnp.ndarray,
+    num_structures_per_molecule: jnp.ndarray,
+    left_mask: jnp.ndarray,
+    right_mask: jnp.ndarray,
+    max_left_samples_per_molecule: int,
+    max_right_samples_per_molecule: int,
+    max_pairs_per_molecule: int,
+    margin: float = 0.0,
+    min_delta: float = 0.0,
+    pair_power: float = 1.0,
+    sample_mask: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """
+    Compute a bounded molecule-local hinge ranking loss over top-target samples.
+
+    This avoids materializing the full ``N x N`` pair matrix. For each molecule it
+    selects the highest-target valid samples from the left and right sets, then
+    evaluates a deterministic capped set of pair positions.
+    """
+
+    prediction = jnp.asarray(prediction, dtype=jnp.float32)
+    target = jnp.asarray(target, dtype=jnp.float32)
+    counts = jnp.asarray(num_structures_per_molecule, dtype=jnp.int32)
+    left_mask = jnp.asarray(left_mask, dtype=jnp.float32) > 0.5
+    right_mask = jnp.asarray(right_mask, dtype=jnp.float32) > 0.5
+    margin = jnp.asarray(margin, dtype=jnp.float32)
+    min_delta = jnp.asarray(min_delta, dtype=jnp.float32)
+    pair_power = jnp.asarray(pair_power, dtype=jnp.float32)
+    if sample_mask is None:
+        sample_mask = jnp.ones_like(target, dtype=jnp.float32)
+    else:
+        sample_mask = jnp.asarray(sample_mask, dtype=jnp.float32)
+
+    total_length = int(prediction.shape[0])
+    num_molecules = int(counts.shape[0])
+    left_k = min(max(1, int(max_left_samples_per_molecule)), total_length)
+    right_k = min(max(1, int(max_right_samples_per_molecule)), total_length)
+    pair_count = max(1, int(max_pairs_per_molecule))
+
+    molecule_index = moleculeIndexFromCounts(counts=counts, total_length=total_length)
+    molecule_ids = jnp.arange(num_molecules, dtype=jnp.int32)[:, None]
+    same_molecule = molecule_index[None, :] == molecule_ids
+    valid_sample = sample_mask[None, :] > 0.5
+    invalid_score = jnp.asarray(-1.0e9, dtype=jnp.float32)
+
+    left_score = jnp.where(
+        same_molecule & left_mask[None, :] & valid_sample,
+        target[None, :],
+        invalid_score,
+    )
+    right_score = jnp.where(
+        same_molecule & right_mask[None, :] & valid_sample,
+        target[None, :],
+        invalid_score,
+    )
+    left_value, left_index = jax.lax.top_k(left_score, left_k)
+    right_value, right_index = jax.lax.top_k(right_score, right_k)
+    left_valid = left_value > (invalid_score * 0.5)
+    right_valid = right_value > (invalid_score * 0.5)
+
+    pair_id = jnp.arange(pair_count, dtype=jnp.int32)
+    left_position = pair_id % left_k
+    gap = 1 + (pair_id // left_k)
+    right_position = (left_position + gap) % right_k
+
+    left_pair_index = left_index[:, left_position]
+    right_pair_index = right_index[:, right_position]
+    left_pair_valid = left_valid[:, left_position]
+    right_pair_valid = right_valid[:, right_position]
+
+    pred_delta = prediction[left_pair_index] - prediction[right_pair_index]
+    target_delta = target[left_pair_index] - target[right_pair_index]
+    valid_pair = (
+        left_pair_valid
+        & right_pair_valid
+        & (left_pair_index != right_pair_index)
+        & (target_delta > min_delta)
+    )
+    pair_weight = jnp.power(jnp.maximum(target_delta, 0.0), pair_power)
+    hinge = jnp.maximum(margin - pred_delta, 0.0)
+    valid_pair_weight = jnp.where(valid_pair, pair_weight, 0.0)
+    valid_pair_loss = jnp.where(valid_pair, pair_weight * hinge, 0.0)
+
+    total_weight_per_molecule = jnp.sum(valid_pair_weight, axis=1)
+    total_loss_per_molecule = jnp.sum(valid_pair_loss, axis=1)
+    per_molecule_loss = total_loss_per_molecule / jnp.maximum(total_weight_per_molecule, 1.0e-12)
+    valid_molecules = total_weight_per_molecule > 1.0e-12
+    return (
+        jnp.sum(jnp.where(valid_molecules, per_molecule_loss, 0.0))
+        / jnp.maximum(jnp.sum(valid_molecules.astype(jnp.float32)), 1.0)
+    )
+
+
 def topMassObjectiveLoss(
     prediction: jnp.ndarray,
     target: jnp.ndarray,
@@ -309,6 +405,9 @@ def topMassObjectiveLoss(
     rank_loss_margin: float,
     rank_loss_min_delta: float,
     rank_pair_power: float,
+    max_focus_rank_samples_per_molecule: int = 0,
+    max_tail_rank_samples_per_molecule: int = 0,
+    max_rank_pairs_per_molecule: int = 0,
     sample_mask: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
     """
@@ -347,26 +446,65 @@ def topMassObjectiveLoss(
         offset=0.0,
         sample_mask=tail_sample_mask,
     )
-    focus_rank_loss = pairwiseRankLoss(
-        prediction=prediction,
-        target=target,
-        num_structures_per_molecule=num_structures_per_molecule,
-        margin=rank_loss_margin,
-        min_delta=rank_loss_min_delta,
-        pair_power=rank_pair_power,
-        sample_mask=focus_sample_mask,
+    use_sampled_ranking = (
+        int(max_focus_rank_samples_per_molecule) > 0
+        and int(max_rank_pairs_per_molecule) > 0
     )
-    focus_tail_rank_loss = crossSetMarginLoss(
-        prediction=prediction,
-        target=target,
-        num_structures_per_molecule=num_structures_per_molecule,
-        left_mask=top_mass_focus_mask,
-        right_mask=1.0 - top_mass_focus_mask,
-        margin=rank_loss_margin,
-        min_delta=rank_loss_min_delta,
-        pair_power=rank_pair_power,
-        sample_mask=sample_mask,
-    )
+    if use_sampled_ranking:
+        tail_rank_samples = (
+            int(max_tail_rank_samples_per_molecule)
+            if int(max_tail_rank_samples_per_molecule) > 0
+            else int(max_focus_rank_samples_per_molecule)
+        )
+        focus_rank_loss = sampledTopKMarginLoss(
+            prediction=prediction,
+            target=target,
+            num_structures_per_molecule=num_structures_per_molecule,
+            left_mask=top_mass_focus_mask,
+            right_mask=top_mass_focus_mask,
+            max_left_samples_per_molecule=max_focus_rank_samples_per_molecule,
+            max_right_samples_per_molecule=max_focus_rank_samples_per_molecule,
+            max_pairs_per_molecule=max_rank_pairs_per_molecule,
+            margin=rank_loss_margin,
+            min_delta=rank_loss_min_delta,
+            pair_power=rank_pair_power,
+            sample_mask=sample_mask,
+        )
+        focus_tail_rank_loss = sampledTopKMarginLoss(
+            prediction=prediction,
+            target=target,
+            num_structures_per_molecule=num_structures_per_molecule,
+            left_mask=top_mass_focus_mask,
+            right_mask=1.0 - top_mass_focus_mask,
+            max_left_samples_per_molecule=max_focus_rank_samples_per_molecule,
+            max_right_samples_per_molecule=tail_rank_samples,
+            max_pairs_per_molecule=max_rank_pairs_per_molecule,
+            margin=rank_loss_margin,
+            min_delta=rank_loss_min_delta,
+            pair_power=rank_pair_power,
+            sample_mask=sample_mask,
+        )
+    else:
+        focus_rank_loss = pairwiseRankLoss(
+            prediction=prediction,
+            target=target,
+            num_structures_per_molecule=num_structures_per_molecule,
+            margin=rank_loss_margin,
+            min_delta=rank_loss_min_delta,
+            pair_power=rank_pair_power,
+            sample_mask=focus_sample_mask,
+        )
+        focus_tail_rank_loss = crossSetMarginLoss(
+            prediction=prediction,
+            target=target,
+            num_structures_per_molecule=num_structures_per_molecule,
+            left_mask=top_mass_focus_mask,
+            right_mask=1.0 - top_mass_focus_mask,
+            margin=rank_loss_margin,
+            min_delta=rank_loss_min_delta,
+            pair_power=rank_pair_power,
+            sample_mask=sample_mask,
+        )
 
     total_regression_loss = (
         top_mass_regression_weight * focus_regression_loss

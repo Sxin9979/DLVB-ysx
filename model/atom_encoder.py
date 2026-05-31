@@ -322,7 +322,7 @@ class ScalarVectorEquivariantMessageLayer(nnx.Module):
         return e3nn.spherical_harmonics(
             self.angular_irreps,
             direction,
-            normalize=True,
+            normalize=False,
             normalization="component",
         )
 
@@ -471,8 +471,10 @@ class ScalarVectorEquivariantMessageLayer(nnx.Module):
 
         with jax.default_matmul_precision("highest"):
             edge_vector = positions[receivers] - positions[senders]
-            distance = jnp.linalg.norm(edge_vector, axis=-1)
-            direction = edge_vector / jnp.maximum(distance[:, None], 1e-8)
+            squared_distance = jnp.sum(jnp.square(edge_vector), axis=-1)
+            safe_inverse_distance = jax.lax.rsqrt(squared_distance[:, None] + 1.0e-12)
+            distance = jnp.sqrt(squared_distance + 1.0e-12)
+            direction = edge_vector * safe_inverse_distance
 
             angular_state = self.angularState(direction)
             tp_state = self.tensorProductMessage(

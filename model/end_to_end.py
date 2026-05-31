@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import flax.nnx as nnx
+import jax
 import jraph
 import jax.numpy as jnp
 
@@ -28,6 +29,60 @@ class EndToEndModelConfig:
     rumer: RumerEncoderConfig
 
 
+class AtomBackgroundEncoder(nnx.Module):
+    """
+    Build atom-level background tokens from E3nn scalar channels and vector invariants.
+    """
+
+    def __init__(
+        self,
+        scalar_dim: int,
+        vector_dim: int,
+        output_dim: int,
+        rngs: nnx.Rngs,
+    ):
+        """
+        Initialize atom background encoder.
+
+        Arguments:
+        - scalar_dim: Atom scalar channel size.
+        - vector_dim: Atom vector channel size.
+        - output_dim: Output background token size.
+        - rngs: Flax NNX random container.
+        """
+
+        self.linear1 = nnx.Linear(scalar_dim + vector_dim, output_dim, rngs=rngs)
+        self.linear2 = nnx.Linear(output_dim, output_dim, rngs=rngs)
+
+    def activate(self, value: jnp.ndarray) -> jnp.ndarray:
+        """
+        Apply SiLU activation.
+        """
+
+        return jax.nn.silu(value)
+
+    def __call__(
+        self,
+        scalar_feature: jnp.ndarray,
+        vector_feature: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Build one background token per atom from E3nn outputs.
+
+        Arguments:
+        - scalar_feature: Atom scalar tensor, shape [total_atoms, scalar_dim].
+        - vector_feature: Atom vector tensor, shape [total_atoms, vector_dim, 3].
+
+        Returns:
+        - Atom background feature tensor, shape [total_atoms, output_dim].
+        """
+
+        vector_norm = jnp.sqrt(jnp.sum(jnp.square(vector_feature), axis=-1) + 1.0e-12)
+        background_input = jnp.concatenate([scalar_feature, vector_norm], axis=-1)
+        hidden = self.activate(self.linear1(background_input))
+        return self.linear2(hidden)
+
+
 class EndToEndE3VBModel(nnx.Module):
     """
     Full end-to-end architecture:
@@ -46,6 +101,12 @@ class EndToEndE3VBModel(nnx.Module):
         self.config = config
         self.atom_encoder = AtomE3Encoder(config=config.atom, rngs=rngs)
         self.projection = AtomToOrbitalProjectionStack(config=config.orbital, rngs=rngs)
+        self.atom_background_encoder = AtomBackgroundEncoder(
+            scalar_dim=config.atom.scalar_dim,
+            vector_dim=config.atom.vector_dim,
+            output_dim=config.rumer.hidden_dim,
+            rngs=rngs,
+        )
         self.rumer_encoder = RumerGraphEncoder(config=config.rumer, rngs=rngs)
 
     def createRumerGraphWithNodeFeature(
@@ -95,6 +156,24 @@ class EndToEndE3VBModel(nnx.Module):
         denominator = jnp.maximum(jnp.sum(pair_mask), 1.0)
         return jnp.sum(similarity * pair_mask) / denominator
 
+    def activeDirectionOrthogonalityPenalty(
+        self,
+        slot_direction: jnp.ndarray,
+        active_capacity: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Penalize active slots on the same atom that learn the same 3D direction.
+        """
+
+        max_slots = int(slot_direction.shape[1])
+        slot_ids = jnp.arange(max_slots, dtype=jnp.int32)[None, :]
+        valid_slot_mask = (slot_ids < active_capacity[:, None]).astype(slot_direction.dtype)
+        pair_mask = valid_slot_mask[:, :, None] * valid_slot_mask[:, None, :]
+        pair_mask = pair_mask * (1.0 - jnp.eye(max_slots, dtype=slot_direction.dtype)[None, :, :])
+        direction_dot = jnp.einsum("asd,atd->ast", slot_direction, slot_direction)
+        denominator = jnp.maximum(jnp.sum(pair_mask), 1.0)
+        return jnp.sum(jnp.square(direction_dot) * pair_mask) / denominator
+
     def forwardWithAux(self, batch: UnifiedBatch) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """
         Run forward prediction together with auxiliary regularization terms.
@@ -120,13 +199,33 @@ class EndToEndE3VBModel(nnx.Module):
             orbital_atom_index=batch.orbital_atom_index,
             orbital_role=batch.orbital_role,
             active_slot_index=batch.active_slot_index,
+            active_rumer_graph=batch.active_rumer_graph,
+            active_orbital_index=batch.active_orbital_index,
             local_frame_e1=expanded_local_frame_e1,
             local_frame_e2=expanded_local_frame_e2,
             local_frame_e3=expanded_local_frame_e3,
         )
+        atom_background_feature = self.atom_background_encoder(
+            scalar_feature=atom_output["scalar"],
+            vector_feature=atom_output["vector"],
+        )
+        background_atom_mask = (projection_output["active_capacity"] == 0).astype(jnp.float32)
         slot_diversity_penalty = self.slotDiversityPenalty(
             slot_alpha=projection_output["slot_alpha"],
             active_capacity=projection_output["active_capacity"],
+        )
+        active_direction_orthogonality_penalty = self.activeDirectionOrthogonalityPenalty(
+            slot_direction=projection_output["slot_direction"],
+            active_capacity=projection_output["active_capacity"],
+        )
+        slot_regularization_penalty = (
+            slot_diversity_penalty + active_direction_orthogonality_penalty
+        )
+        slot_regularization_penalty = jnp.nan_to_num(
+            slot_regularization_penalty,
+            nan=0.0,
+            posinf=1.0e6,
+            neginf=0.0,
         )
         if self.config.rumer.mode == "active_only_low_risk":
             rumer_graph = None
@@ -162,12 +261,15 @@ class EndToEndE3VBModel(nnx.Module):
             orbital_role=batch.orbital_role,
             active_rumer_graph=active_rumer_graph,
             active_rumer_graph_q3_flipped=active_rumer_graph_q3_flipped,
-            full_orbital_feature=projection_output["orbital_feature"],
-            full_orbital_feature_q3_flipped=projection_output["orbital_feature_q3_flipped"],
+            atom_background_feature=atom_background_feature,
+            background_atom_mask=background_atom_mask,
+            num_atoms_per_graph=batch.num_atoms_per_graph,
             num_orbitals_per_graph=batch.num_orbitals_per_graph,
         )
         return prediction, {
-            "slot_diversity_penalty": slot_diversity_penalty,
+            "slot_diversity_penalty": slot_regularization_penalty,
+            "slot_alpha_diversity_penalty": slot_diversity_penalty,
+            "active_direction_orthogonality_penalty": active_direction_orthogonality_penalty,
         }
 
     def __call__(self, batch: UnifiedBatch):

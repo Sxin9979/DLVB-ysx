@@ -50,6 +50,7 @@ model:
 training:
   seed: 0
   batch_size: 8
+  eval_batch_size: 1
   epochs: 1200
   learning_rate: 1.0e-3
   min_learning_rate: 1.0e-6
@@ -93,6 +94,8 @@ training:
   top_mass_sample_strategy: focus_plus_mixed_tail
   mixed_tail_top_fraction: 0.5
   max_tail_samples_per_molecule: 96
+  max_batch_cost: 300000
+  max_structure_cost_per_molecule: 60000
   molecule_balanced_sampling: true
   dataset_sampling_strategy: balanced
   checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/checkpoints/best_e2e_checked_vb_unified_topmass_lowmem.pkl

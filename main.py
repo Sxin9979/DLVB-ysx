@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime
+from functools import partial
 import os
 from pathlib import Path
 from typing import Dict, List
@@ -129,7 +130,7 @@ def trainStep(
     )
 
 
-@nnx.jit
+@partial(nnx.jit, static_argnums=(12, 13, 14))
 def trainStepTopMass(
     model,
     optimizer,
@@ -143,6 +144,9 @@ def trainStepTopMass(
     top_mass_regression_weight,
     top_mass_ranking_weight,
     tail_suppression_weight,
+    max_focus_rank_samples_per_molecule,
+    max_tail_rank_samples_per_molecule,
+    max_rank_pairs_per_molecule,
 ):
     """
     Jitted training step for the top-mass objective.
@@ -165,6 +169,9 @@ def trainStepTopMass(
             rank_loss_margin=rank_loss_margin,
             rank_loss_min_delta=rank_loss_min_delta,
             rank_pair_power=rank_pair_power,
+            max_focus_rank_samples_per_molecule=max_focus_rank_samples_per_molecule,
+            max_tail_rank_samples_per_molecule=max_tail_rank_samples_per_molecule,
+            max_rank_pairs_per_molecule=max_rank_pairs_per_molecule,
             sample_mask=batch.sample_mask,
         )
         slot_diversity_penalty = auxiliary["slot_diversity_penalty"]
@@ -335,13 +342,13 @@ class PreprocessRunner:
                 "PREPROCESS_DONE "
                 f"train_molecules={len(processed_cache.split_ids['train'])} "
                 f"train_chunks={len(packed_cache.splitChunks('train'))} "
-                f"train_structures={packed_cache.split_structure_counts['train']} "
+                f"train_structures={packed_cache.splitStructureCounts()['train']} "
                 f"val_molecules={len(processed_cache.split_ids['val'])} "
                 f"val_chunks={len(packed_cache.splitChunks('val'))} "
-                f"val_structures={packed_cache.split_structure_counts['val']} "
+                f"val_structures={packed_cache.splitStructureCounts()['val']} "
                 f"test_molecules={len(processed_cache.split_ids['test'])} "
                 f"test_chunks={len(packed_cache.splitChunks('test'))} "
-                f"test_structures={packed_cache.split_structure_counts['test']}"
+                f"test_structures={packed_cache.splitStructureCounts()['test']}"
             )
         finally:
             if self.logger is not None:
@@ -433,22 +440,21 @@ class ExperimentRunner:
 
         processor = UnifiedSampleProcessor(self.config.data)
         packed_cache = processor.requirePackedDatasetCache()
+        packed_view_name = self.config.training.packed_molecule_view
         self.dataset_ids = list(getattr(packed_cache, "dataset_ids", None) or ["default"])
         self.split_molecule_ids_by_dataset = getattr(packed_cache, "split_ids_by_dataset", None)
-        self.split_structure_counts_by_dataset = getattr(
-            packed_cache,
-            "split_structure_counts_by_dataset",
-            None,
+        self.split_structure_counts_by_dataset = packed_cache.splitStructureCountsByDataset(
+            view_name=packed_view_name
         )
         self.split_molecule_ids = {
             split_name: list(packed_cache.split_ids[split_name])
             for split_name in ["train", "val", "test"]
         }
         self.split_molecule_chunks = {
-            split_name: packed_cache.splitChunks(split_name)
+            split_name: packed_cache.splitChunks(split_name, view_name=packed_view_name)
             for split_name in ["train", "val", "test"]
         }
-        self.split_structure_counts = dict(packed_cache.split_structure_counts)
+        self.split_structure_counts = packed_cache.splitStructureCounts(view_name=packed_view_name)
         if self.sample_limit_per_split is not None:
             limit = int(self.sample_limit_per_split)
             for split_name in ["train", "val", "test"]:
@@ -486,7 +492,8 @@ class ExperimentRunner:
         self.log(
             "CACHE "
             f"processed_cache={self.config.data.processed_cache_path} "
-            f"packed_cache={self.config.data.packed_cache_path}"
+            f"packed_cache={self.config.data.packed_cache_path} "
+            f"packed_view={packed_view_name}"
         )
         adapter = GraphPackingAdapter(lap_pe_k=self.config.model.atom.lap_pe_k)
         self.pipeline = GrainPipeline(
@@ -528,10 +535,17 @@ class ExperimentRunner:
             decay_steps=max(1, self.total_train_steps - 1),
             alpha=cosine_alpha,
         )
-        transformation = optax.adamw(
+        adamw = optax.adamw(
             learning_rate=self.learning_rate_schedule,
             weight_decay=self.config.training.weight_decay,
         )
+        if float(self.config.training.gradient_clip_norm) > 0.0:
+            transformation = optax.chain(
+                optax.clip_by_global_norm(float(self.config.training.gradient_clip_norm)),
+                adamw,
+            )
+        else:
+            transformation = adamw
         self.optimizer = nnx.Optimizer(self.model, transformation)
 
     def resolveRuntimeLogPath(self) -> str:
@@ -754,6 +768,9 @@ class ExperimentRunner:
                 self.config.training.top_mass_regression_weight,
                 self.config.training.top_mass_ranking_weight,
                 self.config.training.tail_suppression_weight,
+                self.config.training.max_focus_rank_samples_per_molecule,
+                self.config.training.max_tail_rank_samples_per_molecule,
+                self.config.training.max_rank_pairs_per_molecule,
             )
         else:
             (
@@ -836,15 +853,51 @@ class ExperimentRunner:
         Estimate the number of batches for one split.
         """
 
+        batch_size = (
+            self.config.training.batch_size
+            if training
+            else self.config.training.eval_batch_size
+        )
         if self.usesMoleculeGroupedBatches():
             grouped_chunks = self.split_molecule_chunk_groups[split_name]
             if training:
                 bucket_key = self.trainBucketKey()
+                if (
+                    self.config.training.max_batch_cost is not None
+                    and int(self.config.training.max_batch_cost) > 0
+                ):
+                    return len(
+                        self.pipeline.buildBudgetedGroupedBatchIndices(
+                            chunk_groups=grouped_chunks,
+                            batch_size=batch_size,
+                            shuffle=True,
+                            seed=self.config.training.seed,
+                            bucket_key=bucket_key,
+                            drop_remainder=self.config.training.train_drop_remainder,
+                            dataset_sampling_strategy=self.config.training.dataset_sampling_strategy,
+                            max_batch_cost=int(self.config.training.max_batch_cost),
+                            top_mass_sample_strategy=(
+                                self.config.training.top_mass_sample_strategy
+                                if self.config.training.use_top_mass_objective
+                                else "full_molecule"
+                            ),
+                            max_tail_samples_per_molecule=(
+                                self.config.training.max_tail_samples_per_molecule
+                                if self.config.training.use_top_mass_objective
+                                else None
+                            ),
+                            max_structure_cost_per_molecule=(
+                                self.config.training.max_structure_cost_per_molecule
+                                if self.config.training.use_top_mass_objective
+                                else None
+                            ),
+                        )
+                    )
                 if self.config.training.dataset_sampling_strategy == "balanced":
                     return len(
                         self.pipeline.buildDatasetBalancedGroupedBatchIndices(
                             chunk_groups=grouped_chunks,
-                            batch_size=self.config.training.batch_size,
+                            batch_size=batch_size,
                             shuffle=True,
                             seed=self.config.training.seed,
                             bucket_key=bucket_key,
@@ -855,7 +908,7 @@ class ExperimentRunner:
                     return len(
                         self.pipeline.buildGroupedBatchIndices(
                             chunk_groups=grouped_chunks,
-                            batch_size=self.config.training.batch_size,
+                            batch_size=batch_size,
                             shuffle=True,
                             seed=self.config.training.seed,
                             bucket_key=bucket_key,
@@ -863,7 +916,6 @@ class ExperimentRunner:
                         )
                     )
             total_groups = len(grouped_chunks)
-            batch_size = self.config.training.batch_size
             if training and self.config.training.train_drop_remainder:
                 return total_groups // batch_size
             return int(np.ceil(total_groups / batch_size))
@@ -874,7 +926,7 @@ class ExperimentRunner:
                 return len(
                     self.pipeline.buildBucketedBatchIndices(
                         chunks=self.split_molecule_chunks[split_name],
-                        batch_size=self.config.training.batch_size,
+                        batch_size=batch_size,
                         shuffle=True,
                         seed=self.config.training.seed,
                         bucket_key=bucket_key,
@@ -883,7 +935,6 @@ class ExperimentRunner:
                 )
 
         total_chunks = len(self.split_molecule_chunks[split_name])
-        batch_size = self.config.training.batch_size
         if training and self.config.training.train_drop_remainder:
             return total_chunks // batch_size
         return int(np.ceil(total_chunks / batch_size))
@@ -988,10 +1039,15 @@ class ExperimentRunner:
         # Keep the iterator order stable across epochs to avoid triggering
         # fresh JAX/XLA compilations from new bucket/shuffle layouts.
         split_seed = self.config.training.seed
+        batch_size = (
+            self.config.training.batch_size
+            if training
+            else self.config.training.eval_batch_size
+        )
         if self.usesMoleculeGroupedBatches():
             iterator = self.pipeline.createMoleculeIterator(
                 molecule_groups=self.split_molecule_chunk_groups[split_name],
-                batch_size=self.config.training.batch_size,
+                batch_size=batch_size,
                 shuffle=training,
                 seed=split_seed,
                 drop_remainder=training and self.config.training.train_drop_remainder,
@@ -1013,11 +1069,21 @@ class ExperimentRunner:
                 dataset_sampling_strategy=(
                     self.config.training.dataset_sampling_strategy if training else "natural"
                 ),
+                max_batch_cost=(
+                    self.config.training.max_batch_cost
+                    if training
+                    else None
+                ),
+                max_structure_cost_per_molecule=(
+                    self.config.training.max_structure_cost_per_molecule
+                    if training and self.config.training.use_top_mass_objective
+                    else None
+                ),
             )
         else:
             iterator = self.pipeline.createIterator(
                 sample_groups=self.split_molecule_chunks[split_name],
-                batch_size=self.config.training.batch_size,
+                batch_size=batch_size,
                 shuffle=training,
                 seed=split_seed,
                 drop_remainder=training and self.config.training.train_drop_remainder,
@@ -1186,10 +1252,13 @@ class ExperimentRunner:
                     )
         self.log(
             "BATCHING "
-            f"molecules_per_batch={self.config.training.batch_size} "
+            f"train_molecules_per_batch={self.config.training.batch_size} "
+            f"eval_molecules_per_batch={self.config.training.eval_batch_size} "
             f"batch_unit={'molecule_groups' if self.usesMoleculeGroupedBatches() else 'chunks'} "
             f"max_structures_per_chunk={self.config.data.max_structures_per_chunk} "
             f"dataset_sampling={self.config.training.dataset_sampling_strategy} "
+            f"max_batch_cost={self.config.training.max_batch_cost} "
+            f"max_structure_cost_per_molecule={self.config.training.max_structure_cost_per_molecule} "
             f"train_bucketed={str(self.config.training.bucketed_batching).lower()} "
             f"train_bucket_key={self.trainBucketKey()} "
             f"fixed_bucketed={str(self.config.training.fixed_bucket_batching).lower()} "
@@ -1214,7 +1283,12 @@ class ExperimentRunner:
             f"eval_interval_epochs={self.config.training.eval_interval_epochs} "
             f"test_on_best_only={str(self.config.training.test_on_best_only).lower()} "
             f"batch_log_interval={self.config.training.batch_log_interval} "
-            f"iterator_log_interval={self.config.training.iterator_log_interval}"
+            f"iterator_log_interval={self.config.training.iterator_log_interval} "
+            f"max_focus_rank_samples_per_molecule="
+            f"{self.config.training.max_focus_rank_samples_per_molecule} "
+            f"max_tail_rank_samples_per_molecule="
+            f"{self.config.training.max_tail_rank_samples_per_molecule} "
+            f"max_rank_pairs_per_molecule={self.config.training.max_rank_pairs_per_molecule}"
         )
 
         for epoch in range(total_epochs):

@@ -106,6 +106,7 @@ class Predictor:
             structure_strings.append(structure_lookup[structure_sample.vb_index].structure_string)
             samples.append(
                 UnifiedSample(
+                    dataset_id="inference",
                     molecule_id=built.molecule_id,
                     vb_index=structure_sample.vb_index,
                     atom_numbers=built.atom_numbers.copy(),

@@ -1,0 +1,186 @@
+# Custom E3VB inference input template.
+#
+# Purpose:
+# - Describe one molecule in a format specialized for E3VB.
+# - Generate VB structures with genstr() instead of reading a standard .xmo file.
+# - Convert this YAML into one temporary E3VB-compatible .xmi + .str pair, then
+#   run predict.py with the existing xmi+str inference path.
+#
+# Notes:
+# - Atom indices in `orbitals[*].atoms` are 1-based.
+# - Orbital order is critical. The last `active_space.nao` orbitals are treated
+#   as active orbitals by the current E3VB parser/builder.
+# - For active orbitals, `atoms` must contain exactly one atom index.
+# - For inactive orbitals, `atoms` may contain either one atom index
+#   (core/lone-pair-like orbital) or two atom indices (bonding orbital).
+
+schema_version: 1
+
+molecule:
+  molecule_id: example_10698
+  atoms:
+    - symbol: O
+      xyz: [2.450821, 0.114087, 0.005167]
+    - symbol: C
+      xyz: [0.414691, -1.211812, -0.000348]
+    - symbol: C
+      xyz: [0.373097, 1.237118, -0.000424]
+    - symbol: C
+      xyz: [-1.725417, -0.026223, -0.005486]
+    - symbol: C
+      xyz: [1.079445, 0.022612, 0.002428]
+    - symbol: C
+      xyz: [-0.985448, -1.209756, -0.004706]
+    - symbol: C
+      xyz: [-1.020721, 1.185121, -0.004826]
+    - symbol: C
+      xyz: [1.199474, -2.502954, -0.001347]
+    - symbol: C
+      xyz: [1.126474, 2.542577, -0.001214]
+    - symbol: C
+      xyz: [-3.236475, -0.043612, 0.006616]
+    - symbol: H
+      xyz: [-1.506203, -2.164976, -0.008133]
+    - symbol: H
+      xyz: [-1.573572, 2.122468, -0.008766]
+    - symbol: H
+      xyz: [1.845420, -2.595574, -0.885631]
+    - symbol: H
+      xyz: [1.840784, -2.599610, 0.885865]
+    - symbol: H
+      xyz: [0.529044, -3.365440, -0.005025]
+    - symbol: H
+      xyz: [1.774629, 2.628584, 0.877964]
+    - symbol: H
+      xyz: [1.780164, 2.624510, -0.876661]
+    - symbol: H
+      xyz: [0.437498, 3.391194, -0.005272]
+    - symbol: H
+      xyz: [-3.653020, 0.609813, -0.768076]
+    - symbol: H
+      xyz: [-3.624496, -1.051807, -0.164869]
+    - symbol: H
+      xyz: [-3.636724, 0.303457, 0.967282]
+    - symbol: H
+      xyz: [2.829192, -0.773743, 0.005833]
+
+active_space:
+  nae: 6
+  nao: 6
+  multiplicity: 1
+
+structure_generation:
+  source: genstr
+  structure_class: FULL
+  index_base: 1
+  # Optional:
+  # - `selected_vb_indices` can restrict prediction/export to a subset after
+  #   generation.
+  # - Keep it null to score all generated structures.
+  selected_vb_indices: null
+  # Optional manual override for debugging. Leave null in the normal path.
+  manual_structure_strings: null
+
+orbitals:
+  # In this example there are 40 total orbitals, of which the last 6 are active.
+  # That implies:
+  # - inactive_orbital_count = 40 - 6 = 34
+  # - genstr n_total_electrons = nae + 2 * inactive_orbital_count = 74
+  #
+  # The converter should derive these counts automatically from this list.
+  #
+  # Each item:
+  # - `orbital_id` is optional redundancy for readability/validation.
+  # - `atoms` lists the owning atom indices in 1-based convention.
+  # - One atom => core-like / lone-pair-like orbital.
+  # - Two atoms => inactive bonding orbital.
+
+  - orbital_id: 1
+    atoms: [1]
+  - orbital_id: 2
+    atoms: [1]
+  - orbital_id: 3
+    atoms: [1]
+  - orbital_id: 4
+    atoms: [2]
+  - orbital_id: 5
+    atoms: [3]
+  - orbital_id: 6
+    atoms: [4]
+  - orbital_id: 7
+    atoms: [5]
+  - orbital_id: 8
+    atoms: [6]
+  - orbital_id: 9
+    atoms: [7]
+  - orbital_id: 10
+    atoms: [8]
+  - orbital_id: 11
+    atoms: [9]
+  - orbital_id: 12
+    atoms: [10]
+  - orbital_id: 13
+    atoms: [1, 22]
+  - orbital_id: 14
+    atoms: [1, 5]
+  - orbital_id: 15
+    atoms: [2, 8]
+  - orbital_id: 16
+    atoms: [2, 5]
+  - orbital_id: 17
+    atoms: [2, 6]
+  - orbital_id: 18
+    atoms: [3, 7]
+  - orbital_id: 19
+    atoms: [3, 9]
+  - orbital_id: 20
+    atoms: [3, 5]
+  - orbital_id: 21
+    atoms: [4, 6]
+  - orbital_id: 22
+    atoms: [4, 10]
+  - orbital_id: 23
+    atoms: [4, 7]
+  - orbital_id: 24
+    atoms: [6, 11]
+  - orbital_id: 25
+    atoms: [7, 12]
+  - orbital_id: 26
+    atoms: [8, 14]
+  - orbital_id: 27
+    atoms: [8, 13]
+  - orbital_id: 28
+    atoms: [8, 15]
+  - orbital_id: 29
+    atoms: [9, 18]
+  - orbital_id: 30
+    atoms: [9, 17]
+  - orbital_id: 31
+    atoms: [9, 16]
+  - orbital_id: 32
+    atoms: [10, 19]
+  - orbital_id: 33
+    atoms: [10, 21]
+  - orbital_id: 34
+    atoms: [10, 20]
+  - orbital_id: 35
+    atoms: [2]
+  - orbital_id: 36
+    atoms: [6]
+  - orbital_id: 37
+    atoms: [4]
+  - orbital_id: 38
+    atoms: [7]
+  - orbital_id: 39
+    atoms: [3]
+  - orbital_id: 40
+    atoms: [5]
+
+expected_generated_artifacts:
+  # The converter can emit an E3VB-compatible .xmi with:
+  # - $ctrl: at least `nae` and `nao`
+  # - $geo: `symbol x y z`
+  # - $orb: one ignored header line, then one line per orbital
+  xmi_path: /tmp/example_10698.e3vb.xmi
+  str_path: /tmp/example_10698.e3vb.str
+  prediction_output_path: /tmp/example_10698.predictions.tsv

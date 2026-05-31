@@ -319,8 +319,14 @@ class PackedChunkReference:
     - num_chunks: Total number of chunks for the parent molecule.
     - chunk_path: On-disk pickle path for this chunk payload.
     - num_structures: Number of VB structures stored in this chunk.
+    - num_focus_structures: Number of top-mass focus structures stored in this chunk.
+    - static_num_atoms: Number of molecule-static atoms stored once for this chunk.
     - total_atoms: Total packed atom nodes across all structure graphs in this chunk.
+    - total_atom_edges: Total packed atom edges across all structure graphs in this chunk.
     - total_orbitals: Total packed orbital nodes across all structure graphs in this chunk.
+    - total_rumer_edges: Total packed Rumer edges across all structure graphs in this chunk.
+    - total_active_orbitals: Total packed active orbital nodes across all structure graphs in this chunk.
+    - total_active_rumer_edges: Total packed active-only Rumer edges across all structure graphs in this chunk.
     """
 
     molecule_id: str
@@ -328,9 +334,17 @@ class PackedChunkReference:
     num_chunks: int
     chunk_path: str
     num_structures: int
+    num_focus_structures: int
+    static_num_atoms: int
     total_atoms: int
+    total_atom_edges: int
     total_orbitals: int
+    total_rumer_edges: int
+    total_active_orbitals: int
+    total_active_rumer_edges: int
     dataset_id: str = "default"
+    storage_format: str = "pickle"
+    hdf5_dataset_path: Optional[str] = None
 
 
 @dataclass
@@ -371,6 +385,14 @@ class PackedDatasetCache:
     - split_structure_counts: Structure counts for each split.
     - split_structure_counts_by_dataset: Structure counts for each split grouped
       by dataset id.
+    - packed_chunks_by_view: Optional legacy in-memory packed chunk mapping with
+      one extra top-level view key such as ``full`` or ``focus_only``.
+    - packed_chunk_refs_by_view: Optional streaming chunk references keyed by
+      view then split.
+    - split_structure_counts_by_view: Optional structure counts keyed by
+      view then split.
+    - split_structure_counts_by_dataset_by_view: Optional dataset-level
+      structure counts keyed by view then split then dataset id.
     - packed_chunks: Optional legacy in-memory mapping from split name to packed
       single-molecule chunks.
     - packed_chunk_refs: Optional mapping from split name to lightweight chunk
@@ -379,17 +401,31 @@ class PackedDatasetCache:
 
     split_ids: Dict[str, List[str]]
     split_structure_counts: Dict[str, int]
+    packed_chunks_by_view: Optional[Dict[str, Dict[str, List[PackedMoleculeChunk]]]] = None
+    packed_chunk_refs_by_view: Optional[Dict[str, Dict[str, List[PackedChunkReference]]]] = None
+    split_structure_counts_by_view: Optional[Dict[str, Dict[str, int]]] = None
+    split_structure_counts_by_dataset_by_view: Optional[Dict[str, Dict[str, Dict[str, int]]]] = None
     packed_chunks: Optional[Dict[str, List[PackedMoleculeChunk]]] = None
     packed_chunk_refs: Optional[Dict[str, List[PackedChunkReference]]] = None
     dataset_ids: Optional[List[str]] = None
     split_ids_by_dataset: Optional[Dict[str, Dict[str, List[str]]]] = None
     split_structure_counts_by_dataset: Optional[Dict[str, Dict[str, int]]] = None
 
-    def splitChunks(self, split_name: str) -> List[PackedMoleculeChunk | PackedChunkReference]:
+    def splitChunks(
+        self,
+        split_name: str,
+        view_name: str = "full",
+    ) -> List[PackedMoleculeChunk | PackedChunkReference]:
         """
         Return chunk records for one split, preferring lightweight references.
         """
 
+        packed_chunk_refs_by_view = getattr(self, "packed_chunk_refs_by_view", None)
+        if packed_chunk_refs_by_view is not None:
+            return list(packed_chunk_refs_by_view[view_name][split_name])
+        packed_chunks_by_view = getattr(self, "packed_chunks_by_view", None)
+        if packed_chunks_by_view is not None:
+            return list(packed_chunks_by_view[view_name][split_name])
         packed_chunk_refs = getattr(self, "packed_chunk_refs", None)
         if packed_chunk_refs is not None:
             return list(packed_chunk_refs[split_name])
@@ -397,6 +433,41 @@ class PackedDatasetCache:
         if packed_chunks is not None:
             return list(packed_chunks[split_name])
         raise ValueError("PackedDatasetCache does not contain any packed chunk records.")
+
+    def splitStructureCounts(self, view_name: str = "full") -> Dict[str, int]:
+        """
+        Return structure counts for one selected packed view.
+        """
+
+        split_structure_counts_by_view = getattr(self, "split_structure_counts_by_view", None)
+        if split_structure_counts_by_view is not None:
+            return dict(split_structure_counts_by_view[view_name])
+        return dict(self.split_structure_counts)
+
+    def splitStructureCountsByDataset(
+        self,
+        view_name: str = "full",
+    ) -> Optional[Dict[str, Dict[str, int]]]:
+        """
+        Return dataset-level structure counts for one selected packed view.
+        """
+
+        split_structure_counts_by_dataset_by_view = getattr(
+            self,
+            "split_structure_counts_by_dataset_by_view",
+            None,
+        )
+        if split_structure_counts_by_dataset_by_view is not None:
+            return {
+                split_name: dict(dataset_counts)
+                for split_name, dataset_counts in split_structure_counts_by_dataset_by_view[view_name].items()
+            }
+        if self.split_structure_counts_by_dataset is None:
+            return None
+        return {
+            split_name: dict(dataset_counts)
+            for split_name, dataset_counts in self.split_structure_counts_by_dataset.items()
+        }
 
 
 @jax.tree_util.register_pytree_node_class

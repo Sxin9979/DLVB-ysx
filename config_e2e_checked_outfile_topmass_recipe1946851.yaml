@@ -1,9 +1,9 @@
 data:
-  xmo_dir: /pool1/home/ysxin/E3nnVB/VB/out_file
+  xmo_dir: /pool1/home/ysxin/autovb_newoutfile/checked_outfile
   seed: 0
   split: [0.8, 0.1, 0.1]
-  processed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/processed_dataset_cache_vboutfile.pkl
-  packed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/packed_dataset_cache_vboutfile.pkl
+  processed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/processed_dataset_cache_checked_outfile.pkl
+  packed_cache_path: /pool1/home/ysxin/E3nn/E3VB/processed/packed_dataset_cache_checked_outfile.pkl
   max_structures_per_chunk: 16
 
 model:
@@ -89,5 +89,5 @@ training:
   top_mass_sample_strategy: focus_plus_random_tail
   max_tail_samples_per_molecule: 48
   molecule_balanced_sampling: true
-  checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/checkpoints/best_e2e_vboutfile_topmass_lowmem.pkl
-  log_path: /pool1/home/ysxin/E3nn/E3VB/logs/train_e2e_vboutfile_topmass_lowmem.log
+  checkpoint_path: /pool1/home/ysxin/E3nn/E3VB/checkpoints/best_e2e_checked_outfile_topmass_recipe1946851.pkl
+  log_path: /pool1/home/ysxin/E3nn/E3VB/logs/train_e2e_checked_outfile_topmass_recipe1946851.log
